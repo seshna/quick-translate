@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "shaun.quick-translate",
+  "name": "Quick Translate",
+  "version": "0.1.0",
+  "author": "Shaun",
+  "license": "MIT",
+  "description": "A keyboard-friendly Google Translate overlay.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {"overlay": "QuickTranslate.qml"}
+}
