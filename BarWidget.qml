@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -7,38 +8,46 @@ BarWidget {
   id: root
   moduleName: "shaun.quick-translate"
   property bool showBarIcon: true
-  property string responseText: ""
-  readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("quick_translate.py").toString().replace(/^file:\/\//, ""))
+  readonly property string stateRoot: Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state"
+  readonly property string preferencesPath: stateRoot + "/omarchy/quick-translate/preferences.json"
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
   visible: showBarIcon
 
-  function refreshPreferences() {
-    if (!preferences.running) preferences.running = true
+  function applyPreferences(text) {
+    try {
+      var preferences = JSON.parse(text)
+      showBarIcon = preferences.showBarIcon !== false
+    } catch (e) {
+      showBarIcon = true
+    }
+  }
+  function setBarIconVisible(value) { showBarIcon = value === true }
+
+  FileView {
+    id: preferencesFile
+    path: root.preferencesPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applyPreferences(text())
+    onLoadFailed: root.showBarIcon = true
   }
 
-  Component.onCompleted: refreshPreferences()
-
+  // Atomic replacement can invalidate an inotify watch on some filesystems.
+  // Keep an infrequent FileView reload as a fallback; overlay changes update
+  // bar widgets immediately through the shell, without launching a process.
   Timer {
-    interval: 1200
+    interval: 30000
     running: true
     repeat: true
-    onTriggered: root.refreshPreferences()
+    onTriggered: preferencesFile.reload()
   }
 
-  Process {
-    id: preferences
-    command: ["python3", root.helperPath]
-    stdinEnabled: true
-    onStarted: write('{"operation":"preferences.get","params":{}}\n')
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.responseText = text }
-    onExited: function(code) {
-      if (code !== 0) return
-      try {
-        var reply = JSON.parse(root.responseText.trim())
-        if (reply.ok && reply.data) root.showBarIcon = reply.data.showBarIcon !== false
-      } catch (e) {}
+  Component.onCompleted: {
+    if (preferencesFile.loaded) {
+      root.applyPreferences(preferencesFile.text())
     }
   }
 

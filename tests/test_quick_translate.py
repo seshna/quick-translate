@@ -13,6 +13,14 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(qt.preferences_get()["data"], qt.DEFAULTS)
     path = Path(qt.state_path()); path.parent.mkdir(parents=True); path.write_text("bad")
     self.assertEqual(qt.preferences_get()["data"], qt.DEFAULTS)
+  def test_preferences_do_not_share_mutable_defaults(self):
+    preferences = qt.preferences_get()["data"]
+    preferences["shortcuts"]["copy"] = "Alt+C"
+    self.assertEqual(qt.preferences_get()["data"]["shortcuts"], qt.DEFAULT_SHORTCUTS)
+  def test_invalid_stored_shortcuts_fall_back_to_a_complete_default_map(self):
+    path = Path(qt.state_path()); path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"shortcuts": {**qt.DEFAULT_SHORTCUTS, "copy": "Ctrl+U"}}))
+    self.assertEqual(qt.preferences_get()["data"]["shortcuts"], qt.DEFAULT_SHORTCUTS)
   def test_preferences_atomic_and_private(self):
     result = qt.preferences_set({"sourceLanguage":"ja", "targetLanguage":"en"})
     self.assertTrue(result["ok"]); path = Path(qt.state_path())
@@ -38,6 +46,16 @@ class QuickTranslateTests(unittest.TestCase):
     for shortcut in ("Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+J", "A", "Enter", "Meta+U"):
       with self.subTest(shortcut=shortcut):
         self.assertEqual(qt.preferences_set({"shortcuts": {"switch": shortcut}})["error"]["code"], "reserved_shortcut")
+  def test_rejects_malformed_shortcuts_and_allows_function_keys(self):
+    for shortcut in ("Ctrl+", "Ctrl+AA", "Ctrl+Ctrl+A", "Shift+A", "F36"):
+      with self.subTest(shortcut=shortcut):
+        self.assertFalse(qt.preferences_set({"shortcuts": {"switch": shortcut}})["ok"])
+    self.assertTrue(qt.preferences_set({"shortcuts": {"switch": "F12"}})["ok"])
+  def test_reset_shortcuts_uses_helper_defaults(self):
+    self.assertTrue(qt.preferences_set({"shortcuts": {"copy": "Alt+C"}})["ok"])
+    result = qt.handle({"operation": "preferences.resetShortcuts", "params": {}})
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["data"]["shortcuts"], qt.DEFAULT_SHORTCUTS)
   def test_invalid_language_and_limits(self):
     self.assertFalse(qt.preferences_set({"sourceLanguage":"xx","targetLanguage":"en"})["ok"])
     self.assertEqual(qt.translate({"text":"", "sourceLanguage":"en","targetLanguage":"ja"})["error"]["code"], "blank_input")
@@ -48,6 +66,12 @@ class QuickTranslateTests(unittest.TestCase):
   def test_parse_google_response(self):
     self.assertEqual(qt.parse_google_response('[[["hola","hello",null,null,1],[" mundo"," world",null,null,1]]]'), "hola mundo")
     with self.assertRaises(ValueError): qt.parse_google_response("{}")
+  def test_language_catalogue_is_shared_with_the_ui(self):
+    catalogue = json.loads((HERE / "languages.json").read_text())
+    self.assertEqual(qt.LANGUAGE_CODES, {row[0] for row in catalogue})
+  def test_helper_version_uses_the_manifest_version(self):
+    manifest = json.loads((HERE / "manifest.json").read_text())
+    self.assertEqual(qt.PLUGIN_VERSION, manifest["version"])
   def test_response_size_is_bounded(self):
     payload = b'[[["hola","hello",null,null,1]]]'
     self.assertEqual(qt.read_google_response(io.BytesIO(payload)), "hola")
@@ -115,14 +139,27 @@ class QuickTranslateTests(unittest.TestCase):
   def test_qml_bridge_uses_stdin_without_a_shell(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     self.assertIn('bridge.command = ["python3", helperPath]', qml)
+    self.assertIn('Qt.resolvedUrl("languages.json")', qml)
+    self.assertIn('function loadLanguages(text)', qml)
+    self.assertIn('Flickable {', qml)
+    self.assertIn('contentHeight: content.implicitHeight', qml)
+    self.assertGreaterEqual(qml.count('ScrollView {'), 2)
+    self.assertIn('text: "Translating…"', qml)
+    self.assertIn('opacity: .55', qml)
     self.assertIn("stdinEnabled: true", qml)
     self.assertIn('write(payload + "\\n")', qml)
     self.assertNotIn('["bash", "-c"', qml)
   def test_qml_exposes_configurable_shortcuts_and_icons(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
-    self.assertIn('sequence: root.shortcuts.translate', qml)
+    self.assertIn('sequence: root.shortcut("translate")', qml)
     self.assertIn('Show in menu bar', qml)
     self.assertIn('Show shortcut hints', qml)
+    self.assertIn('text: "About"', qml)
+    self.assertIn('text: "Settings"', qml)
+    self.assertIn('Item { Layout.preferredHeight: Style.spacing.md }', qml)
+    self.assertNotIn('How translation works', qml)
+    self.assertIn('Google’s unofficial no-key Translate endpoint', qml)
+    self.assertIn('avoid sending sensitive content to Google.', qml)
     self.assertIn('sequence: "Ctrl+?"', qml)
     self.assertIn('"󰒓  Ctrl+?"', qml)
     self.assertIn('"󰁍  Ctrl+?"', qml)
@@ -132,15 +169,19 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('sequence: "Ctrl+K"', qml)
     self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertNotIn('Enter or Space change', qml)
-    self.assertIn('function focusSettingsSelection()', qml)
-    self.assertIn('barIconSwitch.forceActiveFocus()', qml)
-    self.assertIn('undoRecorder.forceActiveFocus()', qml)
-    self.assertIn('restoreButton.forceActiveFocus()', qml)
+    self.assertIn('settingsControls = [barIconSwitch, hotkeysSwitch', qml)
+    self.assertIn('settingsControls.length', qml)
+    self.assertIn('control.forceActiveFocus()', qml)
     self.assertIn('"Restore all default shortcuts"', qml)
+    self.assertIn('id: restoreButton\n              focusable: true\n              bordered: true', qml)
     self.assertIn('event.key === Qt.Key_Space', qml)
     self.assertIn('function handleActionShortcut(event)', qml)
     self.assertIn('function actionForShortcut(event)', qml)
-    self.assertIn('function reservedShortcutMessage(sequence)', qml)
+    self.assertIn('function performAction(action)', qml)
+    self.assertIn('function syncBarIconVisibility()', qml)
+    self.assertIn('shell.bar.moduleWidgets(pluginId)', qml)
+    self.assertIn('preferences.resetShortcuts', qml)
+    self.assertNotIn('function reservedShortcutMessage(sequence)', qml)
     self.assertIn('root.recordingAction = ""', qml)
     self.assertIn('root.focusSettingsSelection()', qml)
     self.assertIn('Keys.onShortcutOverride', qml)
@@ -150,11 +191,19 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('󰆴  Clear', qml)
     self.assertIn('󰗊  Translate', qml)
     self.assertIn('actionText: "⇄"', qml)
-    self.assertIn('compactActionText: "󰆏 󰆏"', qml)
-    self.assertIn('compactActionText: "󰗊"', qml)
+    self.assertIn('compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"', qml)
+    self.assertIn('compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"', qml)
+    self.assertIn('compactActionText: root.translating ? "󰗊 …" : "󰗊"', qml)
     self.assertIn('!control.showHotkey ? (control.compactActionText !== "" ? control.compactActionText : control.actionText)', qml)
   def test_bar_widget_uses_matching_icon(self):
     qml = (HERE / "BarWidget.qml").read_text()
     self.assertIn('text: "󰗊"', qml)
     self.assertIn('omarchy-shell shell toggle shaun.quick-translate', qml)
+    self.assertIn('FileView {', qml)
+    self.assertIn('import Quickshell', qml)
+    self.assertIn('watchChanges: true', qml)
+    self.assertIn('function setBarIconVisible(value)', qml)
+    self.assertIn('interval: 30000', qml)
+    self.assertIn('onTriggered: preferencesFile.reload()', qml)
+    self.assertNotIn('Process {', qml)
 if __name__ == "__main__": unittest.main()
