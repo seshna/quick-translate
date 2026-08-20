@@ -4,7 +4,8 @@ A fast, keyboard-first translation overlay for [Omarchy](https://omarchy.org/).
 It starts with English → Japanese, remembers your selected language pair, and
 keeps text only for the current Omarchy Shell session.
 
-![Quick Translate overlay preview](preview.png)
+![Quick Translate translator preview](preview.png)
+![Quick Translate settings preview](preview-settings.png)
 
 ## Install
 
