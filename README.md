@@ -16,6 +16,9 @@ The overlay can then be opened from a terminal:
 
     omarchy-shell shell toggle shaun.quick-translate '{}'
 
+It also adds a translate icon to the right side of the Omarchy bar. Open the
+overlay and select the gear icon to hide that bar button or change shortcuts.
+
 To add the suggested Super+Shift+T binding, add this to
 ~/.config/hypr/bindings.lua and reload Hyprland:
 
@@ -38,18 +41,22 @@ Disable and remove the plugin with:
 - English → Japanese by default; selected languages save immediately
 - Copy translation, or copy source and translation together
 - Clear both text boxes and undo the clear
+- A matching Omarchy bar launcher that can be hidden from Setup
+- Reconfigurable action shortcuts, recorded directly from the keyboard
+- Optional shortcut hints on the main page, and `Ctrl+?` to open Setup
 - Up to 5,000 input characters.
 
 ## Shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+Enter | Translate |
-| Ctrl+U | Swap languages and both text boxes |
-| Ctrl+Y | Copy the translation |
-| Ctrl+Shift+Y | Copy source, two newlines, then translation |
-| Ctrl+Shift+K | Clear both text boxes |
-| Ctrl+Z | Undo the most recent Clear |
+| Ctrl+Enter | Translate (configurable) |
+| Ctrl+U | Swap languages and both text boxes (configurable) |
+| Ctrl+Y | Copy the translation (configurable) |
+| Ctrl+Shift+Y | Copy source, two newlines, then translation (configurable) |
+| Ctrl+Shift+K | Clear both text boxes (configurable) |
+| Ctrl+Z | Undo the most recent Clear (configurable) |
+| Ctrl+? | Open Setup |
 | Escape | Close the overlay |
 
 

@@ -11,7 +11,23 @@ import urllib.request
 
 MAX_CHARS = 5000
 MAX_RESPONSE_BYTES = 1024 * 1024
-DEFAULTS = {"sourceLanguage": "en", "targetLanguage": "ja"}
+RESERVED_SHORTCUTS = {"Ctrl+Shift+U", "Ctrl+?", "Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+J", "Ctrl+K"}
+EDITING_KEYS = {"Space", "Enter", "Tab", "Esc", "Backspace", "Delete"}
+DEFAULT_SHORTCUTS = {
+    "copy": "Ctrl+Y",
+    "copyAll": "Ctrl+Shift+Y",
+    "switch": "Ctrl+U",
+    "clear": "Ctrl+Shift+K",
+    "translate": "Ctrl+Enter",
+    "undo": "Ctrl+Z",
+}
+DEFAULTS = {
+    "sourceLanguage": "en",
+    "targetLanguage": "ja",
+    "shortcuts": DEFAULT_SHORTCUTS,
+    "showBarIcon": True,
+    "showHotkeys": True,
+}
 LANGUAGE_CODES = {
     "en", "ja", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk",
     "zh-CN", "zh-TW", "ko", "ar", "hi", "id", "tr", "vi", "th", "sv",
@@ -33,9 +49,15 @@ def preferences_get():
         with open(state_path(), encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, dict): raise ValueError("not an object")
-        result = dict(DEFAULTS)
-        for key in result:
+        result = {"sourceLanguage": DEFAULTS["sourceLanguage"], "targetLanguage": DEFAULTS["targetLanguage"],
+                  "shortcuts": dict(DEFAULT_SHORTCUTS), "showBarIcon": True, "showHotkeys": True}
+        for key in ("sourceLanguage", "targetLanguage"):
             if raw.get(key) in LANGUAGE_CODES: result[key] = raw[key]
+        if isinstance(raw.get("shortcuts"), dict):
+            for key, value in raw["shortcuts"].items():
+                if key in DEFAULT_SHORTCUTS and valid_shortcut(value): result["shortcuts"][key] = value
+        if isinstance(raw.get("showBarIcon"), bool): result["showBarIcon"] = raw["showBarIcon"]
+        if isinstance(raw.get("showHotkeys"), bool): result["showHotkeys"] = raw["showHotkeys"]
         return reply(result)
     except FileNotFoundError:
         return reply(dict(DEFAULTS))
@@ -43,10 +65,43 @@ def preferences_get():
         # Corrupt state is deliberately non-fatal: start from safe defaults.
         return reply(dict(DEFAULTS))
 
+def reserved_shortcut_message(value):
+    if not isinstance(value, str): return None
+    if value == "Ctrl+Shift+U": return "Ctrl+Shift+U is reserved for Unicode input. Choose another shortcut."
+    if value in {"Ctrl+?", "Ctrl+Shift+?", "Ctrl+Shift+/"}: return "Ctrl+? opens Setup. Choose another shortcut."
+    if value in {"Ctrl+J", "Ctrl+K"}: return "Ctrl+J and Ctrl+K navigate Setup. Choose another shortcut."
+    if "Meta+" in value: return "Super shortcuts are managed globally. Choose Ctrl or Alt instead."
+    if value in EDITING_KEYS or (not value.startswith(("Ctrl+", "Alt+", "Meta+")) and not value.startswith("F")):
+        return "Use Ctrl, Alt, or an F-key shortcut to avoid typing and navigation conflicts."
+    return None
+
+def valid_shortcut(value):
+    return isinstance(value, str) and value and len(value) <= 64 and not reserved_shortcut_message(value)
+
 def preferences_set(params):
-    value = {key: params.get(key) for key in DEFAULTS}
-    if any(value[key] not in LANGUAGE_CODES for key in value):
+    current = preferences_get()["data"]
+    value = {
+        "sourceLanguage": params.get("sourceLanguage", current["sourceLanguage"]),
+        "targetLanguage": params.get("targetLanguage", current["targetLanguage"]),
+        "shortcuts": dict(current["shortcuts"]),
+        "showBarIcon": params.get("showBarIcon", current["showBarIcon"]),
+        "showHotkeys": params.get("showHotkeys", current["showHotkeys"]),
+    }
+    if isinstance(params.get("shortcuts"), dict):
+        value["shortcuts"].update(params["shortcuts"])
+    if value["sourceLanguage"] not in LANGUAGE_CODES or value["targetLanguage"] not in LANGUAGE_CODES:
         return fail("invalid_language", "Choose a language from the catalogue.")
+    if not isinstance(value["showBarIcon"], bool):
+        return fail("invalid_preference", "Choose whether to show the menu bar icon.")
+    if not isinstance(value["showHotkeys"], bool):
+        return fail("invalid_preference", "Choose whether to show shortcut hints.")
+    reserved_message = next((reserved_shortcut_message(shortcut) for shortcut in value["shortcuts"].values() if reserved_shortcut_message(shortcut)), None)
+    if reserved_message:
+        return fail("reserved_shortcut", reserved_message)
+    if set(value["shortcuts"]) != set(DEFAULT_SHORTCUTS) or not all(valid_shortcut(v) for v in value["shortcuts"].values()):
+        return fail("invalid_shortcut", "Choose a valid shortcut for every action.")
+    if len(set(value["shortcuts"].values())) != len(value["shortcuts"]):
+        return fail("duplicate_shortcut", "Each action needs a different shortcut.")
     path = state_path(); directory = os.path.dirname(path)
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)

@@ -6,7 +6,13 @@
   "author": "Shaun",
   "license": "MIT",
   "description": "A keyboard-friendly Google Translate overlay.",
-  "kinds": ["overlay"],
+  "kinds": ["overlay", "bar-widget"],
   "keepLoaded": true,
-  "entryPoints": {"overlay": "QuickTranslate.qml"}
+  "entryPoints": {"overlay": "QuickTranslate.qml", "barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Quick Translate",
+    "description": "Open the Quick Translate overlay from the Omarchy bar.",
+    "category": "Productivity",
+    "allowMultiple": false
+  }
 }
