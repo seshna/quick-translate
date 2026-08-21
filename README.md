@@ -1,8 +1,9 @@
 # Quick Translate for Omarchy
 
 A fast, keyboard-first translation overlay for [Omarchy](https://omarchy.org/).
-It starts with English → Japanese, remembers your selected language pair, and
-keeps text only for the current Omarchy Shell session.
+It starts with Google and English → Japanese, remembers your selected
+translator and language pair, and keeps text only for the current Omarchy Shell
+session.
 
 ![Quick Translate translator preview](preview.png)
 ![Quick Translate settings preview](preview-settings.png)
@@ -37,7 +38,8 @@ Disable and remove the plugin with:
 
 ## Features
 
-- Searchable, explicit From and To language selectors
+- Google (default), Apertium, Bing, Reverso, Ollama Local, and OpenAI translators
+- Searchable, engine-aware From and To language selectors
 - Multiline input and read-only translated output
 - English → Japanese by default; selected languages save immediately
 - Copy translation, or copy source and translation together
@@ -63,17 +65,20 @@ Disable and remove the plugin with:
 
 ## Privacy and network use
 
-Translation requests use Google’s unofficial no-key endpoint, the same endpoint
-used by [GTT](https://github.com/eeeXun/gtt). The endpoint may change, rate
-limit, or become unavailable without notice. Entered text is sent to Google in
-an HTTPS request body, so do not use this plugin for sensitive content.
+Translation requests use public, no-key web endpoints for Google, Apertium,
+Bing, and Reverso. These are not supported commercial APIs; they may change,
+rate-limit, or become unavailable without notice. Ollama Local sends requests
+to your local Ollama service; install the `gemma3` model with `ollama pull gemma3`.
+OpenAI sends requests to OpenAI and requires an API key entered in Setup. Entered
+text is sent to the selected provider, so do not use this plugin for sensitive content.
 
-Only the language pair is persisted under the XDG state directory, normally:
+Only the selected translator and language pair are persisted under the XDG state directory, normally:
 
     ~/.local/state/omarchy/quick-translate/preferences.json
 
-The preferences file is written atomically with permissions 0600. Source and
-translated text are never written to disk by the plugin.
+The preferences file is written atomically with permissions 0600. An OpenAI API
+key, when configured, is stored there and is never returned to the UI after it
+is saved. Source and translated text are never written to disk by the plugin.
 
 ## Requirements
 

@@ -22,18 +22,34 @@ class QuickTranslateTests(unittest.TestCase):
     path.write_text(json.dumps({"shortcuts": {**qt.DEFAULT_SHORTCUTS, "copy": "Ctrl+U"}}))
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"], qt.DEFAULT_SHORTCUTS)
   def test_preferences_atomic_and_private(self):
-    result = qt.preferences_set({"sourceLanguage":"ja", "targetLanguage":"en"})
+    result = qt.preferences_set({"sourceLanguage":"ja", "targetLanguage":"en", "openaiApiKey":"sk-test"})
     self.assertTrue(result["ok"]); path = Path(qt.state_path())
     self.assertEqual(json.loads(path.read_text())["sourceLanguage"], "ja")
+    self.assertEqual(json.loads(path.read_text())["openaiApiKey"], "sk-test")
+    self.assertNotIn("openaiApiKey", result["data"])
+    self.assertTrue(result["data"]["openaiApiKeyConfigured"])
     self.assertEqual(json.loads(path.read_text())["shortcuts"], qt.DEFAULT_SHORTCUTS)
     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+    self.assertTrue(qt.preferences_set({"clearOpenaiApiKey": True})["ok"])
+    self.assertFalse(qt.preferences_get()["data"]["openaiApiKeyConfigured"])
   def test_shortcut_and_bar_preferences(self):
-    result = qt.preferences_set({"shortcuts": {"copy": "Alt+C"}, "showBarIcon": False, "showHotkeys": False})
+    result = qt.preferences_set({"shortcuts": {"copy": "Alt+C"}, "translator": "reverso", "showBarIcon": False, "showHotkeys": False})
     self.assertTrue(result["ok"])
     self.assertEqual(result["data"]["shortcuts"]["copy"], "Alt+C")
     self.assertFalse(result["data"]["showBarIcon"])
+    self.assertEqual(result["data"]["translator"], "reverso")
     self.assertFalse(result["data"]["showHotkeys"])
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"]["translate"], "Ctrl+Enter")
+  def test_translation_context_preferences(self):
+    contexts = [{"id": "formal-ja", "name": "Formal Japanese", "instruction": "Use formal Japanese."}]
+    result = qt.preferences_set({"translationContexts": contexts, "selectedContextId": "formal-ja"})
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["data"]["translationContexts"], contexts)
+    self.assertEqual(result["data"]["selectedContextId"], "formal-ja")
+    self.assertEqual(qt.preferences_set({"selectedContextId": "missing"})["error"]["code"], "invalid_context")
+    self.assertEqual(qt.preferences_set({"translationContexts": [{"id": "bad id", "name": "x", "instruction": "y"}]})["error"]["code"], "invalid_context")
+    duplicate = contexts + [{"id": "casual-ja", "name": "formal japanese", "instruction": "Use casual Japanese."}]
+    self.assertEqual(qt.preferences_set({"translationContexts": duplicate})["error"]["code"], "invalid_context")
   def test_rejects_duplicate_shortcuts_and_allows_reassigning_undo(self):
     self.assertTrue(qt.preferences_set({"shortcuts": {"undo": "Alt+Z"}})["ok"])
     self.assertTrue(qt.preferences_set({"shortcuts": {"copy": "Ctrl+Z"}})["ok"])
@@ -60,6 +76,46 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertFalse(qt.preferences_set({"sourceLanguage":"xx","targetLanguage":"en"})["ok"])
     self.assertEqual(qt.translate({"text":"", "sourceLanguage":"en","targetLanguage":"ja"})["error"]["code"], "blank_input")
     self.assertEqual(qt.translate({"text":"x"*5001, "sourceLanguage":"en","targetLanguage":"ja"})["error"]["code"], "input_too_long")
+    self.assertEqual(qt.preferences_set({"translator": "unknown"})["error"]["code"], "invalid_translator")
+    self.assertEqual(qt.translate({"text":"x", "translator":"apertium", "sourceLanguage":"en", "targetLanguage":"ja"})["error"]["code"], "unsupported_language_pair")
+  def test_engine_catalogue_and_public_adapter_parsers(self):
+    engines = {entry["id"]: entry for entry in qt.engine_data()["data"]}
+    self.assertEqual(list(engines), ["google", "apertium", "bing", "reverso", "ollama", "openai"])
+    self.assertEqual(engines["bing"]["maxChars"], 1000)
+    self.assertIn(("en", "es"), [tuple(pair) for pair in engines["apertium"]["pairs"]])
+    self.assertTrue(qt.pair_supported("reverso", "en", "ja"))
+    self.assertFalse(qt.pair_supported("apertium", "en", "ja"))
+    with patch("urllib.request.urlopen") as opener:
+      page = MagicMock(); page.read.return_value = b'<script>IG:"ig" data-iid="iid" params_AbusePreventionHelper = [-123,"token",1]</script>'
+      opener.return_value.__enter__.return_value = page
+      self.assertEqual(qt.bing_credentials(), ("ig", "iid", "-123", "token"))
+  @patch("urllib.request.urlopen")
+  def test_llm_adapters_and_missing_openai_key(self, opener):
+    self.assertEqual(qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})["error"]["code"], "openai_api_key_missing")
+    contexts = [{"id": "formal-ja", "name": "Formal Japanese", "instruction": "Use formal Japanese."}]
+    self.assertTrue(qt.preferences_set({"openaiApiKey":"sk-test", "openaiReasoningEffort":"low", "translationContexts": contexts, "selectedContextId": "formal-ja"})["ok"])
+    response = MagicMock(); response.read.return_value = b'{"output":[{"type":"message","content":[{"type":"output_text","text":"hola"}]}]}'
+    opener.return_value.__enter__.return_value = response
+    result = qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertEqual(result["data"]["translation"], "hola")
+    request = opener.call_args.args[0]
+    self.assertEqual(request.get_header("Authorization"), "Bearer sk-test")
+    payload = json.loads(request.data)
+    self.assertEqual(payload["reasoning"], {"effort": "low"})
+    self.assertIn("Translate the user's text from English to Spanish", payload["input"][0]["content"])
+    self.assertIn("Additional translation context:\nUse formal Japanese.", payload["input"][0]["content"])
+    self.assertEqual(payload["input"][1]["content"], "hello")
+    response.read.return_value = b'{"message":{"content":"hola"}}'
+    result = qt.translate({"text":"hello", "translator":"ollama", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertEqual(result["data"]["translation"], "hola")
+    ollama_payload = json.loads(opener.call_args.args[0].data)
+    self.assertEqual(ollama_payload["model"], "gemma3")
+    self.assertFalse(ollama_payload["stream"])
+    self.assertIn("Additional translation context:\nUse formal Japanese.", ollama_payload["messages"][0]["content"])
+    self.assertTrue(qt.preferences_set({"selectedContextId": ""})["ok"])
+    result = qt.translate({"text":"hello", "translator":"ollama", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertEqual(result["data"]["translation"], "hola")
+    self.assertNotIn("Additional translation context:", json.loads(opener.call_args.args[0].data)["messages"][0]["content"])
   def test_same_language_and_unicode_multiline(self):
     text = "こんにちは\nworld 🌏"
     self.assertEqual(qt.translate({"text":text,"sourceLanguage":"ja","targetLanguage":"ja"})["data"]["translation"], text)
@@ -88,6 +144,20 @@ class QuickTranslateTests(unittest.TestCase):
       self.assertEqual(qt.translate({"text":"x","sourceLanguage":"en","targetLanguage":"ja"})["error"]["code"], "rate_limited")
     finally:
       http_error.close()
+  @patch("urllib.request.urlopen")
+  def test_openai_quota_and_rate_limit_errors(self, opener):
+    import urllib.error
+    self.assertTrue(qt.preferences_set({"openaiApiKey": "sk-test"})["ok"])
+    quota_error = urllib.error.HTTPError("u", 429, "", {}, io.BytesIO(b'{"error":{"code":"insufficient_quota"}}'))
+    opener.side_effect = quota_error
+    result = qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertEqual(result["error"]["code"], "openai_quota")
+    quota_error.close()
+    rate_error = urllib.error.HTTPError("u", 429, "", {}, io.BytesIO(b'{"error":{"code":"rate_limit_exceeded"}}'))
+    opener.side_effect = rate_error
+    result = qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertEqual(result["error"]["code"], "openai_rate_limited")
+    rate_error.close()
   @patch("urllib.request.urlopen")
   def test_translation_text_is_in_post_body_not_url(self, opener):
     response = MagicMock()
@@ -158,8 +228,18 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('text: "Settings"', qml)
     self.assertIn('Item { Layout.preferredHeight: Style.spacing.md }', qml)
     self.assertNotIn('How translation works', qml)
-    self.assertIn('Google’s unofficial no-key Translate endpoint', qml)
-    self.assertIn('avoid sending sensitive content to Google.', qml)
+    self.assertIn('Google, Apertium, Bing, Reverso, Ollama Local, or OpenAI', qml)
+    self.assertIn('id: openaiReasoningPicker', qml)
+    self.assertIn('id: contextPicker', qml)
+    self.assertIn('id: contextEditorPicker', qml)
+    self.assertIn('text: (root.contextEditorOpen ? "󰅂" : "󰅀") + "  Translation contexts"', qml)
+    self.assertIn('visible: root.usesLlm() && root.contextEditorOpen', qml)
+    self.assertIn('function saveContext()', qml)
+    self.assertIn('label: root.reasoningEffortLabel(effort)', qml)
+    self.assertIn('function activeTranslatorLabel()', qml)
+    self.assertIn('Ollama Local · Gemma 3', qml)
+    self.assertIn('OpenAI · GPT-5 mini', qml)
+    self.assertIn('unofficial, may change or rate-limit requests', qml)
     self.assertIn('sequence: "Ctrl+?"', qml)
     self.assertIn('"󰒓  Ctrl+?"', qml)
     self.assertIn('"󰁍  Ctrl+?"', qml)
@@ -169,7 +249,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('sequence: "Ctrl+K"', qml)
     self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertNotIn('Enter or Space change', qml)
-    self.assertIn('settingsControls = [barIconSwitch, hotkeysSwitch', qml)
+    self.assertIn('settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton', qml)
     self.assertIn('settingsControls.length', qml)
     self.assertIn('control.forceActiveFocus()', qml)
     self.assertIn('"Restore all default shortcuts"', qml)
@@ -181,6 +261,16 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('function syncBarIconVisibility()', qml)
     self.assertIn('shell.bar.moduleWidgets(pluginId)', qml)
     self.assertIn('preferences.resetShortcuts', qml)
+    self.assertIn('text: "Translator"', qml)
+    self.assertIn('function translatorOptions()', qml)
+    self.assertIn('No key / public web', qml)
+    self.assertIn('Local model', qml)
+    self.assertIn('API key required', qml)
+    self.assertIn('enabled: !model.section', qml)
+    self.assertIn('root.maxChars.toLocaleString()', qml)
+    self.assertIn('echoMode: TextInput.Password', qml)
+    self.assertIn('function saveOpenaiKey()', qml)
+    self.assertIn('clearOpenaiApiKey: true', qml)
     self.assertNotIn('function reservedShortcutMessage(sequence)', qml)
     self.assertIn('root.recordingAction = ""', qml)
     self.assertIn('root.focusSettingsSelection()', qml)

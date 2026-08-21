@@ -17,11 +17,18 @@ Item {
   property string copiedAction: ""
   property string sourceLanguage: "en"
   property string targetLanguage: "ja"
+  property string translator: "google"
   property string translatedText: ""
   property var shortcuts: ({})
   readonly property var shortcutActions: ["copy", "copyAll", "switch", "clear", "translate", "undo"]
   property bool showBarIcon: true
   property bool showHotkeys: true
+  property bool openaiApiKeyConfigured: false
+  property string openaiReasoningEffort: "minimal"
+  property var translationContexts: []
+  property string selectedContextId: ""
+  property string editingContextId: ""
+  property bool contextEditorOpen: false
   property bool setupOpen: false
   property int settingsSelectedIndex: 0
   property string recordingAction: ""
@@ -36,8 +43,14 @@ Item {
   property var settingsControls: []
   readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("quick_translate.py").toString().replace(/^file:\/\//, ""))
   property var languages: []
+  property var engines: []
+  readonly property var openaiReasoningEfforts: ["minimal", "low", "medium", "high"]
   readonly property string languagesPath: decodeURIComponent(Qt.resolvedUrl("languages.json").toString().replace(/^file:\/\//, ""))
-  readonly property bool canTranslate: !busy && sourceBox.text.trim().length > 0 && sourceBox.text.length <= 5000
+  readonly property int maxChars: {
+    var engine = engineFor(translator)
+    return engine && engine.maxChars ? engine.maxChars : 5000
+  }
+  readonly property bool canTranslate: !busy && sourceBox.text.trim().length > 0 && sourceBox.text.length <= maxChars
 
   component HotkeyButton: Item {
     id: control
@@ -121,16 +134,100 @@ Item {
   }
   function syncLanguageSelectors() {
     if (!fromPicker || !toPicker) return
-    fromPicker.currentIndex = indexForLanguage(sourceLanguage)
-    toPicker.currentIndex = indexForLanguage(targetLanguage)
+    fromPicker.currentIndex = sourceLanguages().map(function(item) { return item[0] }).indexOf(sourceLanguage)
+    toPicker.currentIndex = targetLanguages().map(function(item) { return item[0] }).indexOf(targetLanguage)
     fromPicker.editText = nameFor(sourceLanguage)
     toPicker.editText = nameFor(targetLanguage)
+  }
+  function engineFor(id) { for (var i = 0; i < engines.length; i++) if (engines[i].id === id) return engines[i]; return null }
+  function activeTranslatorLabel() {
+    if (translator === "ollama") return "Ollama Local · Gemma 3"
+    if (translator === "openai") return "OpenAI · GPT-5 mini"
+    var engine = engineFor(translator)
+    return engine ? engine.name : "Google"
+  }
+  function usesLlm() { return translator === "ollama" || translator === "openai" }
+  function contextOptions() {
+    var options = [{id: "", label: "No context"}]
+    for (var i = 0; i < translationContexts.length; i++)
+      options.push({id: translationContexts[i].id, label: translationContexts[i].name})
+    return options
+  }
+  function contextIndex(id) {
+    var options = contextOptions()
+    for (var i = 0; i < options.length; i++) if (options[i].id === id) return i
+    return 0
+  }
+  function contextForId(id) {
+    for (var i = 0; i < translationContexts.length; i++)
+      if (translationContexts[i].id === id) return translationContexts[i]
+    return null
+  }
+  function newContextId() { return "context-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
+  function reasoningEffortLabel(value) { return value.charAt(0).toUpperCase() + value.slice(1) }
+  function openaiReasoningEffortIndex() { return openaiReasoningEfforts.indexOf(openaiReasoningEffort) }
+  function translatorOptions() {
+    var groups = [
+      {title: "No key / public web", ids: ["google", "apertium", "bing", "reverso"]},
+      {title: "Local model", ids: ["ollama"]},
+      {title: "API key required", ids: ["openai"]}
+    ]
+    var options = []
+    for (var i = 0; i < groups.length; i++) {
+      var group = groups[i]
+      var groupEngines = []
+      for (var j = 0; j < group.ids.length; j++) {
+        var engine = engineFor(group.ids[j])
+        if (engine) groupEngines.push(engine)
+      }
+      if (groupEngines.length === 0) continue
+      options.push({section: true, label: group.title})
+      for (var k = 0; k < groupEngines.length; k++)
+        options.push({section: false, id: groupEngines[k].id, label: groupEngines[k].name})
+    }
+    return options
+  }
+  function translatorOptionIndex() {
+    var options = translatorOptions()
+    for (var i = 0; i < options.length; i++) if (options[i].id === translator) return i
+    return 0
+  }
+  function pairsForEngine() { var engine = engineFor(translator); return engine && engine.pairs ? engine.pairs : [] }
+  // An empty pairs list means either the engine has no pair restriction of
+  // its own (e.g. Google, Bing) or engines/languages haven't loaded yet —
+  // in both cases fall back to the full language catalogue rather than
+  // showing no options.
+  function sourceCodes() {
+    var pairs = pairsForEngine()
+    if (pairs.length === 0) return languages.map(function(item) { return item[0] })
+    var result = []
+    for (var i = 0; i < pairs.length; i++) if (result.indexOf(pairs[i][0]) < 0) result.push(pairs[i][0])
+    return result
+  }
+  function targetCodes(source) {
+    var pairs = pairsForEngine()
+    if (pairs.length === 0) return languages.map(function(item) { return item[0] })
+    var result = []
+    for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === source && result.indexOf(pairs[i][1]) < 0) result.push(pairs[i][1])
+    if (sourceCodes().indexOf(source) >= 0 && result.indexOf(source) < 0) result.push(source)
+    return result
+  }
+  function sourceLanguages() { var codes = sourceCodes(); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
+  function targetLanguages() { var codes = targetCodes(sourceLanguage); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
+  function normalizeLanguagePair() {
+    var sources = sourceCodes()
+    if (sources.length === 0) return
+    if (sources.indexOf(sourceLanguage) < 0) sourceLanguage = sources[0]
+    var targets = targetCodes(sourceLanguage)
+    if (targets.indexOf(targetLanguage) < 0) targetLanguage = targets[0]
+    syncLanguageSelectors()
   }
   function loadLanguages(text) {
     try {
       var parsed = JSON.parse(text)
       if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("empty language catalogue")
       languages = parsed
+      normalizeLanguagePair()
       syncLanguageSelectors()
     } catch (e) {
       message = "Could not load the language catalogue."
@@ -154,9 +251,15 @@ Item {
   function applyPreferences(data) {
     sourceLanguage = data.sourceLanguage || "en"
     targetLanguage = data.targetLanguage || "ja"
+    translator = data.translator || "google"
     shortcuts = data.shortcuts || shortcuts
     showBarIcon = data.showBarIcon !== false
     showHotkeys = data.showHotkeys !== false
+    openaiApiKeyConfigured = data.openaiApiKeyConfigured === true
+    openaiReasoningEffort = openaiReasoningEfforts.indexOf(data.openaiReasoningEffort) >= 0 ? data.openaiReasoningEffort : "minimal"
+    translationContexts = Array.isArray(data.translationContexts) ? data.translationContexts : []
+    selectedContextId = contextForId(data.selectedContextId) ? data.selectedContextId : ""
+    normalizeLanguagePair()
     syncLanguageSelectors()
     syncBarIconVisibility()
   }
@@ -175,7 +278,79 @@ Item {
       if (done) done(reply)
     })
   }
-  function saveLanguages() { savePreferences({sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}) }
+  function saveLanguages() { savePreferences({translator: translator, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}) }
+  function setOpenaiReasoningEffort(value) {
+    if (openaiReasoningEfforts.indexOf(value) < 0) return
+    openaiReasoningEffort = value
+    savePreferences({openaiReasoningEffort: value})
+  }
+  function setSelectedContext(value) {
+    if (value !== "" && !contextForId(value)) return
+    selectedContextId = value
+    savePreferences({selectedContextId: value})
+  }
+  function startNewContext() {
+    editingContextId = ""
+    contextNameField.text = ""
+    contextInstructionField.text = ""
+    contextNameField.forceActiveFocus()
+  }
+  function loadContextForEditing(value) {
+    var context = contextForId(value)
+    editingContextId = context ? context.id : ""
+    contextNameField.text = context ? context.name : ""
+    contextInstructionField.text = context ? context.instruction : ""
+  }
+  function saveContext() {
+    var name = contextNameField.text.trim()
+    var instruction = contextInstructionField.text.trim()
+    if (name === "" || instruction === "") { settingsError = "Give the context both a name and an instruction."; return }
+    var id = editingContextId === "" ? newContextId() : editingContextId
+    var contexts = []
+    for (var i = 0; i < translationContexts.length; i++)
+      if (translationContexts[i].id !== id) contexts.push(translationContexts[i])
+    contexts.push({id: id, name: name, instruction: instruction})
+    selectedContextId = id
+    editingContextId = id
+    savePreferences({translationContexts: contexts, selectedContextId: id}, function(reply) {
+      if (reply && reply.ok) { settingsError = ""; loadContextForEditing(id) }
+      else settingsError = reply && reply.error ? reply.error.message : "Could not save translation context."
+    })
+  }
+  function removeContext() {
+    if (editingContextId === "") return
+    var id = editingContextId
+    var contexts = translationContexts.filter(function(context) { return context.id !== id })
+    selectedContextId = selectedContextId === id ? "" : selectedContextId
+    startNewContext()
+    savePreferences({translationContexts: contexts, selectedContextId: selectedContextId}, function(reply) {
+      if (reply && reply.ok) settingsError = ""
+      else settingsError = reply && reply.error ? reply.error.message : "Could not remove translation context."
+    })
+  }
+  function setTranslator(value) {
+    if (!engineFor(value)) return
+    translator = value
+    if (!usesLlm()) contextEditorOpen = false
+    if (settingsControls[settingsSelectedIndex] && !settingsControls[settingsSelectedIndex].visible)
+      settingsSelectedIndex = 0
+    normalizeLanguagePair()
+    saveLanguages()
+  }
+  function saveOpenaiKey() {
+    var key = openaiKeyField.text.trim()
+    if (key === "") { settingsError = "Enter an OpenAI API key, or use Remove key."; return }
+    savePreferences({openaiApiKey: key}, function(reply) {
+      if (reply && reply.ok) { openaiKeyField.text = ""; settingsError = "" }
+      else settingsError = reply && reply.error ? reply.error.message : "Could not save OpenAI API key."
+    })
+  }
+  function clearOpenaiKey() {
+    savePreferences({clearOpenaiApiKey: true}, function(reply) {
+      if (reply && reply.ok) { openaiKeyField.text = ""; settingsError = "" }
+      else settingsError = reply && reply.error ? reply.error.message : "Could not remove OpenAI API key."
+    })
+  }
   function shortcut(action) { return shortcuts[action] || "" }
   function shortcutForEvent(event) {
     if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta) return ""
@@ -231,7 +406,11 @@ Item {
     sourceBox.forceActiveFocus()
   }
   function moveSettingsSelection(direction) {
-    settingsSelectedIndex = (settingsSelectedIndex + direction + settingsControls.length) % settingsControls.length
+    if (settingsControls.length === 0) return
+    var initialIndex = settingsSelectedIndex
+    do {
+      settingsSelectedIndex = (settingsSelectedIndex + direction + settingsControls.length) % settingsControls.length
+    } while (!settingsControls[settingsSelectedIndex].visible && settingsSelectedIndex !== initialIndex)
     focusSettingsSelection()
   }
   function focusSettingsSelection() {
@@ -272,7 +451,7 @@ Item {
   function translate() {
     if (!canTranslate) return
     message = ""
-    run("translate", {text: sourceBox.text, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}, function(reply) {
+    run("translate", {text: sourceBox.text, translator: translator, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}, function(reply) {
       if (showReply(reply)) translatedText = String(reply.data.translation || "")
     })
   }
@@ -323,8 +502,11 @@ Item {
   function toggle() { opened ? dismiss() : open("{}") }
 
   Component.onCompleted: {
-    settingsControls = [barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton]
-    run("preferences.get", {}, function(reply) { if (reply && reply.ok) applyPreferences(reply.data) })
+    settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton, barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton]
+    run("engines.get", {}, function(reply) {
+      if (reply && reply.ok) engines = reply.data || []
+      run("preferences.get", {}, function(preferences) { if (preferences && preferences.ok) applyPreferences(preferences.data) })
+    })
   }
 
   FileView {
@@ -490,19 +672,21 @@ Item {
             id: fromPicker
             Layout.fillWidth: true
             editable: true
-            model: root.languages.map(function(x) { return x[1] })
+            model: root.sourceLanguages().map(function(x) { return x[1] })
             currentIndex: 0
             onEditTextChanged: {
               var match = find(editText, Qt.MatchContains)
               if (match >= 0) currentIndex = match
             }
             onActivated: {
-              root.sourceLanguage = root.languages[currentIndex][0]
+              root.sourceLanguage = root.sourceLanguages()[currentIndex][0]
+              root.normalizeLanguagePair()
               root.syncLanguageSelectors()
               root.saveLanguages()
             }
             onAccepted: {
-              root.sourceLanguage = root.languages[currentIndex][0]
+              root.sourceLanguage = root.sourceLanguages()[currentIndex][0]
+              root.normalizeLanguagePair()
               root.syncLanguageSelectors()
               root.saveLanguages()
             }
@@ -512,19 +696,19 @@ Item {
             id: toPicker
             Layout.fillWidth: true
             editable: true
-            model: root.languages.map(function(x) { return x[1] })
+            model: root.targetLanguages().map(function(x) { return x[1] })
             currentIndex: 1
             onEditTextChanged: {
               var match = find(editText, Qt.MatchContains)
               if (match >= 0) currentIndex = match
             }
             onActivated: {
-              root.targetLanguage = root.languages[currentIndex][0]
+              root.targetLanguage = root.targetLanguages()[currentIndex][0]
               root.syncLanguageSelectors()
               root.saveLanguages()
             }
             onAccepted: {
-              root.targetLanguage = root.languages[currentIndex][0]
+              root.targetLanguage = root.targetLanguages()[currentIndex][0]
               root.syncLanguageSelectors()
               root.saveLanguages()
             }
@@ -548,6 +732,13 @@ Item {
               if (root.actionForShortcut(event) !== "") event.accepted = true
             }
             Keys.onPressed: function(event) {
+              if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                var forward = event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)
+                var next = sourceBox.nextItemInFocusChain(forward)
+                if (next) next.forceActiveFocus()
+                event.accepted = true
+                return
+              }
               // TextInput treats Ctrl+Shift+U as the start of a Unicode code
               // point entry. Intercept configured actions here before that
               // handler sees the key sequence.
@@ -560,7 +751,39 @@ Item {
           Layout.fillWidth: true
           Label { visible: root.translating; text: "Translating…"; color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
           Item { Layout.fillWidth: true }
-          Label { text: sourceBox.text.length + " / 5,000"; color: sourceBox.text.length > 5000 ? "#e06c75" : Color.menu.text; opacity: .75 }
+          Label { text: root.activeTranslatorLabel(); color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
+          ComboBox {
+            id: contextPicker
+            visible: root.usesLlm()
+            Layout.preferredWidth: 260
+            model: root.contextOptions()
+            textRole: "label"
+            currentIndex: root.contextIndex(root.selectedContextId)
+            delegate: MenuItem {
+              required property var model
+              required property int index
+              width: ListView.view.width
+              text: model.label
+              highlighted: contextPicker.highlightedIndex === index
+            }
+            onActivated: root.setSelectedContext(root.contextOptions()[currentIndex].id)
+          }
+          ComboBox {
+            id: openaiReasoningPicker
+            visible: root.translator === "openai"
+            model: root.openaiReasoningEfforts.map(function(effort) { return { label: root.reasoningEffortLabel(effort), value: effort } })
+            textRole: "label"
+            currentIndex: root.openaiReasoningEffortIndex()
+            delegate: MenuItem {
+              required property var model
+              required property int index
+              width: ListView.view.width
+              text: model.label
+              highlighted: openaiReasoningPicker.highlightedIndex === index
+            }
+            onActivated: root.setOpenaiReasoningEffort(root.openaiReasoningEfforts[currentIndex])
+          }
+          Label { text: sourceBox.text.length + " / " + root.maxChars.toLocaleString(); color: sourceBox.text.length > root.maxChars ? "#e06c75" : Color.menu.text; opacity: .75 }
         }
         ScrollView {
           visible: !root.setupOpen
@@ -577,7 +800,7 @@ Item {
           HotkeyButton { actionText: root.copiedAction === "translation" ? "󰆏  Copied ✓" : "󰆏  Copy translation"; compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"; hotkeyText: root.copiedAction === "translation" ? "" : root.shortcut("copy"); reservedText: "󰆏  Copy translation  " + root.shortcut("copy"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(root.translatedText, "translation") }
           HotkeyButton { actionText: root.copiedAction === "both" ? "󰆏 󰆏  Copied ✓" : "󰆏 󰆏  Copy both"; compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"; hotkeyText: root.copiedAction === "both" ? "" : root.shortcut("copyAll"); reservedText: "󰆏 󰆏  Copy both  " + root.shortcut("copyAll"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(sourceBox.text + "\n\n" + root.translatedText, "both") }
           Item { Layout.fillWidth: true }
-          HotkeyButton { actionText: root.translating ? "󰗊  Translating…" : "󰗊  Translate"; compactActionText: root.translating ? "󰗊 …" : "󰗊"; hotkeyText: root.translating ? "" : root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.canTranslate; visuallyMuted: sourceBox.text.trim().length === 0 || sourceBox.text.length > 5000; onClicked: root.translate() }
+          HotkeyButton { actionText: root.translating ? "󰗊  Translating…" : "󰗊  Translate"; compactActionText: root.translating ? "󰗊 …" : "󰗊"; hotkeyText: root.translating ? "" : root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.canTranslate; visuallyMuted: sourceBox.text.trim().length === 0 || sourceBox.text.length > root.maxChars; onClicked: root.translate() }
         }
         ColumnLayout {
           visible: root.setupOpen
@@ -590,7 +813,7 @@ Item {
           }
           Label {
             Layout.fillWidth: true
-            text: "Quick Translate uses Google’s unofficial no-key Translate endpoint in an HTTPS request body.\nThis plugin does not save your text, but it’s still best to avoid sending sensitive content to Google.\n"
+            text: "Choose Google, Apertium, Bing, Reverso, Ollama Local, or OpenAI. Your text is sent to the selected service.\nOllama Local uses localhost; OpenAI sends text to OpenAI. Public no-key web endpoints are unofficial, may change or rate-limit requests, and are not suitable for sensitive text.\n"
             color: Color.menu.text
             opacity: .80
             wrapMode: Text.WordWrap
@@ -605,6 +828,138 @@ Item {
           RowLayout {
             Layout.fillWidth: true
             Label { text: root.settingsSelectedIndex === 0 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: "Translator"; color: Color.menu.text; Layout.fillWidth: true }
+            ComboBox {
+              id: translatorPicker
+              Layout.minimumWidth: Style.space(260)
+              Layout.preferredWidth: Style.space(260)
+              model: root.translatorOptions()
+              textRole: "label"
+              currentIndex: root.translatorOptionIndex()
+              delegate: MenuItem {
+                required property var model
+                required property int index
+                width: ListView.view.width
+                text: model.label
+                enabled: !model.section
+                opacity: model.section ? .65 : 1
+                highlighted: !model.section && translatorPicker.highlightedIndex === index
+              }
+              onActivated: {
+                var option = root.translatorOptions()[currentIndex]
+                if (option && !option.section) root.setTranslator(option.id)
+              }
+            }
+          }
+          Label {
+            visible: root.translator === "ollama" || root.translator === "openai"
+            Layout.fillWidth: true
+            text: root.translator === "ollama"
+              ? "Ollama setup: install and start Ollama, then run: ollama pull gemma3 (about 3.3 GB)"
+              : "OpenAI setup: create an API key at platform.openai.com/api-keys, then paste it below."
+            color: Color.menu.text
+            opacity: .80
+            wrapMode: Text.WordWrap
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.caption
+          }
+          Button {
+            visible: root.usesLlm()
+            Layout.fillWidth: true
+            bordered: true
+            text: (root.contextEditorOpen ? "󰅂" : "󰅀") + "  Translation contexts"
+            onClicked: root.contextEditorOpen = !root.contextEditorOpen
+          }
+          ColumnLayout {
+            visible: root.usesLlm() && root.contextEditorOpen
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+            Label {
+              Layout.fillWidth: true
+              text: "Contexts guide Gemma locally and are sent to OpenAI when it is selected."
+              color: Color.menu.text
+              opacity: .80
+              wrapMode: Text.WordWrap
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.caption
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              Label { text: "Saved context"; color: Color.menu.text; Layout.fillWidth: true }
+              ComboBox {
+                id: contextEditorPicker
+                Layout.preferredWidth: 260
+                model: root.contextOptions()
+                textRole: "label"
+                currentIndex: root.contextIndex(root.editingContextId)
+                delegate: MenuItem {
+                  required property var model
+                  required property int index
+                  width: ListView.view.width
+                  text: model.label
+                  highlighted: contextEditorPicker.highlightedIndex === index
+                }
+                onActivated: root.loadContextForEditing(root.contextOptions()[currentIndex].id)
+              }
+              Button { text: "New"; bordered: true; onClicked: root.startNewContext() }
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              Label { text: "Name"; color: Color.menu.text; Layout.preferredWidth: 120 }
+              TextField {
+                id: contextNameField
+                Layout.fillWidth: true
+                placeholderText: "e.g. Formal Japanese"
+                maximumLength: 64
+                onAccepted: root.saveContext()
+              }
+            }
+            Label { text: "Instruction"; color: Color.menu.text; Layout.fillWidth: true }
+            ScrollView {
+              Layout.fillWidth: true
+              Layout.preferredHeight: 96
+              TextArea {
+                id: contextInstructionField
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                color: Color.menu.text
+                font.family: Style.font.menuFamily
+                placeholderText: "e.g. Use polite Japanese and preserve product names."
+                onTextChanged: if (text.length > 2000) text = text.slice(0, 2000)
+              }
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              Item { Layout.fillWidth: true }
+              Button { text: "Save context"; bordered: true; onClicked: root.saveContext() }
+              Button { text: "Remove"; bordered: true; enabled: root.editingContextId !== ""; onClicked: root.removeContext() }
+            }
+          }
+          RowLayout {
+            visible: root.translator === "openai"
+            Layout.fillWidth: true
+            Label { text: root.settingsSelectedIndex === 1 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: "OpenAI API key"; color: Color.menu.text; Layout.fillWidth: true }
+            TextField {
+              id: openaiKeyField
+              visible: root.translator === "openai"
+              Layout.preferredWidth: 260
+              echoMode: TextInput.Password
+              placeholderText: root.openaiApiKeyConfigured ? "Configured — enter replacement" : "Required for OpenAI"
+              onAccepted: root.saveOpenaiKey()
+            }
+          }
+          RowLayout {
+            visible: root.translator === "openai"
+            Layout.fillWidth: true
+            Label { text: root.settingsSelectedIndex === 2 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: root.openaiApiKeyConfigured ? "OpenAI key is configured" : "No OpenAI key configured"; color: Color.menu.text; Layout.fillWidth: true }
+            Button { text: "Save key"; bordered: true; onClicked: root.saveOpenaiKey() }
+            Button { id: removeOpenaiKeyButton; visible: root.translator === "openai"; text: "Remove key"; bordered: true; enabled: root.openaiApiKeyConfigured; onClicked: root.clearOpenaiKey() }
+          }
+          RowLayout {
+            Layout.fillWidth: true
+            Label { text: root.settingsSelectedIndex === 3 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
             Label { text: "Show in menu bar"; color: Color.menu.text; Layout.fillWidth: true }
             Switch {
               id: barIconSwitch
@@ -622,7 +977,7 @@ Item {
           }
           RowLayout {
             Layout.fillWidth: true
-            Label { text: root.settingsSelectedIndex === 1 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: root.settingsSelectedIndex === 4 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
             Label { text: "Show shortcut hints"; color: Color.menu.text; Layout.fillWidth: true }
             Switch {
               id: hotkeysSwitch
@@ -643,29 +998,29 @@ Item {
             columnSpacing: Style.spacing.md
             rowSpacing: Style.spacing.sm
             Layout.fillWidth: true
-            Label { text: root.settingsSelectedIndex === 2 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Label { text: "Copy translation"; color: Color.menu.text }
-            ShortcutRecorder { id: copyRecorder; actionKey: "copy"; shortcut: root.shortcut("copy"); settingsIndex: 2 }
-            Label { text: root.settingsSelectedIndex === 3 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Label { text: "Copy source and translation"; color: Color.menu.text }
-            ShortcutRecorder { id: copyAllRecorder; actionKey: "copyAll"; shortcut: root.shortcut("copyAll"); settingsIndex: 3 }
-            Label { text: root.settingsSelectedIndex === 4 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Label { text: "Switch languages"; color: Color.menu.text }
-            ShortcutRecorder { id: switchRecorder; actionKey: "switch"; shortcut: root.shortcut("switch"); settingsIndex: 4 }
             Label { text: root.settingsSelectedIndex === 5 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Label { text: "Clear text"; color: Color.menu.text }
-            ShortcutRecorder { id: clearRecorder; actionKey: "clear"; shortcut: root.shortcut("clear"); settingsIndex: 5 }
+            Label { text: "Copy translation"; color: Color.menu.text }
+            ShortcutRecorder { id: copyRecorder; actionKey: "copy"; shortcut: root.shortcut("copy"); settingsIndex: 5 }
             Label { text: root.settingsSelectedIndex === 6 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Label { text: "Translate"; color: Color.menu.text }
-            ShortcutRecorder { id: translateRecorder; actionKey: "translate"; shortcut: root.shortcut("translate"); settingsIndex: 6 }
+            Label { text: "Copy source and translation"; color: Color.menu.text }
+            ShortcutRecorder { id: copyAllRecorder; actionKey: "copyAll"; shortcut: root.shortcut("copyAll"); settingsIndex: 6 }
             Label { text: root.settingsSelectedIndex === 7 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: "Switch languages"; color: Color.menu.text }
+            ShortcutRecorder { id: switchRecorder; actionKey: "switch"; shortcut: root.shortcut("switch"); settingsIndex: 7 }
+            Label { text: root.settingsSelectedIndex === 8 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: "Clear text"; color: Color.menu.text }
+            ShortcutRecorder { id: clearRecorder; actionKey: "clear"; shortcut: root.shortcut("clear"); settingsIndex: 8 }
+            Label { text: root.settingsSelectedIndex === 9 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: "Translate"; color: Color.menu.text }
+            ShortcutRecorder { id: translateRecorder; actionKey: "translate"; shortcut: root.shortcut("translate"); settingsIndex: 9 }
+            Label { text: root.settingsSelectedIndex === 10 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
             Label { text: "Undo Clear"; color: Color.menu.text }
-            ShortcutRecorder { id: undoRecorder; actionKey: "undo"; shortcut: root.shortcut("undo"); settingsIndex: 7 }
+            ShortcutRecorder { id: undoRecorder; actionKey: "undo"; shortcut: root.shortcut("undo"); settingsIndex: 10 }
           }
           Label { visible: root.settingsError !== ""; text: root.settingsError; color: "#e06c75"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
           RowLayout {
             Layout.fillWidth: true
-            Label { text: root.settingsSelectedIndex === 8 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Label { text: root.settingsSelectedIndex === 11 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
             Button {
               id: restoreButton
               focusable: true

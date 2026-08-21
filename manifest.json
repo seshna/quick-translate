@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "shaun.quick-translate",
   "name": "Quick Translate",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "author": "Shaun",
   "license": "MIT",
   "description": "A keyboard-friendly Google Translate overlay.",
@@ -13,6 +13,7 @@
     "displayName": "Quick Translate",
     "description": "Open the Quick Translate overlay from the Omarchy bar.",
     "category": "Productivity",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }
