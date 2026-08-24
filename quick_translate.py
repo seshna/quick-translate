@@ -246,7 +246,11 @@ def preferences_set(params):
         return fail("invalid_context", "Choose a valid translation context.")
     if not isinstance(value["openaiApiKey"], str) or len(value["openaiApiKey"]) > 512:
         return fail("invalid_api_key", "Enter a valid OpenAI API key.")
-    shortcut_message = next((shortcut_error(shortcut) for shortcut in value["shortcuts"].values() if shortcut_error(shortcut)), None)
+    shortcut_message = None
+    for shortcut in value["shortcuts"].values():
+        shortcut_message = shortcut_error(shortcut)
+        if shortcut_message:
+            break
     if shortcut_message:
         return fail("reserved_shortcut", shortcut_message)
     if set(value["shortcuts"]) != set(DEFAULT_SHORTCUTS):

@@ -5,7 +5,7 @@
   "version": "0.3.0",
   "author": "Shaun",
   "license": "MIT",
-  "description": "A keyboard-friendly Google Translate overlay.",
+  "description": "A keyboard-friendly translation overlay with public, local, and OpenAI providers.",
   "kinds": ["overlay", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {"overlay": "QuickTranslate.qml", "barWidget": "BarWidget.qml"},

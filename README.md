@@ -72,7 +72,9 @@ to your local Ollama service; install the `gemma3` model with `ollama pull gemma
 OpenAI sends requests to OpenAI and requires an API key entered in Setup. Entered
 text is sent to the selected provider, so do not use this plugin for sensitive content.
 
-Only the selected translator and language pair are persisted under the XDG state directory, normally:
+The selected translator and language pair, shortcut and display preferences,
+translation contexts, OpenAI reasoning effort, and optional OpenAI API key are
+persisted under the XDG state directory, normally:
 
     ~/.local/state/omarchy/quick-translate/preferences.json
 

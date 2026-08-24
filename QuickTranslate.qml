@@ -14,9 +14,11 @@ Item {
   property bool opened: false
   property bool busy: false
   property bool translating: false
+  property var pendingOperations: []
   property string copiedAction: ""
   property string sourceLanguage: "en"
   property string targetLanguage: "ja"
+  property bool syncingLanguageSelectors: false
   property string translator: "google"
   property string translatedText: ""
   property var shortcuts: ({})
@@ -129,15 +131,50 @@ Item {
   }
 
   function nameFor(code) { for (var i=0;i<languages.length;i++) if (languages[i][0] === code) return languages[i][1]; return code }
-  function indexForLanguage(code) {
-    return languages.map(function(item) { return item[0] }).indexOf(code)
-  }
   function syncLanguageSelectors() {
     if (!fromPicker || !toPicker) return
+    syncingLanguageSelectors = true
     fromPicker.currentIndex = sourceLanguages().map(function(item) { return item[0] }).indexOf(sourceLanguage)
     toPicker.currentIndex = targetLanguages().map(function(item) { return item[0] }).indexOf(targetLanguage)
     fromPicker.editText = nameFor(sourceLanguage)
     toPicker.editText = nameFor(targetLanguage)
+    syncingLanguageSelectors = false
+  }
+  function exactLanguageIndex(options, label) {
+    var normalized = String(label || "").trim().toLowerCase()
+    for (var i = 0; i < options.length; i++)
+      if (String(options[i][1]).toLowerCase() === normalized) return i
+    return -1
+  }
+  function selectSourceLanguage(index) {
+    var options = sourceLanguages()
+    if (index < 0 || index >= options.length) return
+    sourceLanguage = options[index][0]
+    normalizeLanguagePair()
+    syncLanguageSelectors()
+    saveLanguages()
+  }
+  function selectTargetLanguage(index) {
+    var options = targetLanguages()
+    if (index < 0 || index >= options.length) return
+    targetLanguage = options[index][0]
+    syncLanguageSelectors()
+    saveLanguages()
+  }
+  function commitDisplayedLanguages() {
+    var previousSource = sourceLanguage
+    var previousTarget = targetLanguage
+    var sourceLabel = fromPicker.editText
+    var targetLabel = toPicker.editText
+    var sourceOptions = sourceLanguages()
+    var sourceIndex = exactLanguageIndex(sourceOptions, sourceLabel)
+    if (sourceIndex >= 0) sourceLanguage = sourceOptions[sourceIndex][0]
+    var targetOptions = targetLanguages()
+    var targetIndex = exactLanguageIndex(targetOptions, targetLabel)
+    if (targetIndex >= 0) targetLanguage = targetOptions[targetIndex][0]
+    normalizeLanguagePair()
+    syncLanguageSelectors()
+    return sourceLanguage !== previousSource || targetLanguage !== previousTarget
   }
   function engineFor(id) { for (var i = 0; i < engines.length; i++) if (engines[i].id === id) return engines[i]; return null }
   function activeTranslatorLabel() {
@@ -234,8 +271,7 @@ Item {
       messageError = true
     }
   }
-  function run(operation, params, done) {
-    if (busy) return
+  function startOperation(operation, params, done) {
     busy = true
     translating = operation === "translate"
     bridge.payload = JSON.stringify({operation: operation, params: params || {}})
@@ -243,10 +279,33 @@ Item {
     bridge.command = ["python3", helperPath]
     bridge.running = true
   }
+  function run(operation, params, done) {
+    if (busy) {
+      pendingOperations = pendingOperations.concat([{operation: operation, params: params || {}, done: done}])
+      return
+    }
+    startOperation(operation, params, done)
+  }
+  function startNextOperation() {
+    if (busy || pendingOperations.length === 0) return
+    var next = pendingOperations[0]
+    pendingOperations = pendingOperations.slice(1)
+    startOperation(next.operation, next.params, next.done)
+  }
   function showReply(reply) {
     if (reply && reply.ok) { message = ""; messageError = false; return true }
     message = reply && reply.error ? reply.error.message : "The helper did not return a valid response."
     messageError = true; return false
+  }
+  function translationRequestIsCurrent(request) {
+    return sourceBox.text === request.text
+        && translator === request.translator
+        && sourceLanguage === request.sourceLanguage
+        && targetLanguage === request.targetLanguage
+        && selectedContextId === request.selectedContextId
+        && openaiReasoningEffort === request.openaiReasoningEffort
+        && fromPicker.editText === nameFor(sourceLanguage)
+        && toPicker.editText === nameFor(targetLanguage)
   }
   function applyPreferences(data) {
     sourceLanguage = data.sourceLanguage || "en"
@@ -274,9 +333,31 @@ Item {
   }
   function savePreferences(params, done) {
     run("preferences.set", params, function(reply) {
-      if (showReply(reply) && reply.data) applyPreferences(reply.data)
+      if (showReply(reply) && reply.data) applyPreferenceResult(params, reply.data)
       if (done) done(reply)
     })
+  }
+  function applyPreferenceResult(params, data) {
+    var merged = {
+      sourceLanguage: sourceLanguage,
+      targetLanguage: targetLanguage,
+      translator: translator,
+      shortcuts: shortcuts,
+      showBarIcon: showBarIcon,
+      showHotkeys: showHotkeys,
+      openaiApiKeyConfigured: openaiApiKeyConfigured,
+      openaiReasoningEffort: openaiReasoningEffort,
+      translationContexts: translationContexts,
+      selectedContextId: selectedContextId
+    }
+    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId"]
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i]
+      if (Object.prototype.hasOwnProperty.call(params, field)) merged[field] = data[field]
+    }
+    if (Object.prototype.hasOwnProperty.call(params, "openaiApiKey") || params.clearOpenaiApiKey === true)
+      merged.openaiApiKeyConfigured = data.openaiApiKeyConfigured === true
+    applyPreferences(merged)
   }
   function saveLanguages() { savePreferences({translator: translator, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}) }
   function setOpenaiReasoningEffort(value) {
@@ -450,8 +531,22 @@ Item {
   function handleActionShortcut(event) { return performAction(actionForShortcut(event)) }
   function translate() {
     if (!canTranslate) return
+    if (commitDisplayedLanguages()) saveLanguages()
     message = ""
-    run("translate", {text: sourceBox.text, translator: translator, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}, function(reply) {
+    var request = {
+      text: sourceBox.text,
+      translator: translator,
+      sourceLanguage: sourceLanguage,
+      targetLanguage: targetLanguage,
+      selectedContextId: selectedContextId,
+      openaiReasoningEffort: openaiReasoningEffort
+    }
+    run("translate", request, function(reply) {
+      if (!translationRequestIsCurrent(request)) {
+        message = "Translation discarded because the text or settings changed."
+        messageError = false
+        return
+      }
       if (showReply(reply)) translatedText = String(reply.data.translation || "")
     })
   }
@@ -549,6 +644,8 @@ Item {
       var reply = null
       if (code === 0) {
         try { reply = JSON.parse(bridge.responseText.trim()) } catch (e) { reply = null }
+      } else {
+        reply = {ok: false, error: {code: "helper_failed", message: "The translator helper failed to run."}}
       }
       var callback = bridge.done
       bridge.done = null
@@ -556,11 +653,13 @@ Item {
       root.busy = false
       root.translating = false
       if (code !== 0) {
-        root.message = "The translator helper failed to run."
+        root.message = reply.error.message
         root.messageError = true
-      } else if (callback) {
+      }
+      if (callback) {
         callback(reply)
       }
+      root.startNextOperation()
     }
   }
 
@@ -682,20 +781,14 @@ Item {
             model: root.sourceLanguages().map(function(x) { return x[1] })
             currentIndex: 0
             onEditTextChanged: {
+              if (root.syncingLanguageSelectors) return
               var match = find(editText, Qt.MatchContains)
               if (match >= 0) currentIndex = match
             }
-            onActivated: {
-              root.sourceLanguage = root.sourceLanguages()[currentIndex][0]
-              root.normalizeLanguagePair()
-              root.syncLanguageSelectors()
-              root.saveLanguages()
-            }
+            onActivated: root.selectSourceLanguage(currentIndex)
             onAccepted: {
-              root.sourceLanguage = root.sourceLanguages()[currentIndex][0]
-              root.normalizeLanguagePair()
-              root.syncLanguageSelectors()
-              root.saveLanguages()
+              var exact = root.exactLanguageIndex(root.sourceLanguages(), editText)
+              root.selectSourceLanguage(exact >= 0 ? exact : currentIndex)
             }
           }
           HotkeyButton { actionText: "⇄"; hotkeyText: root.shortcut("switch"); available: !root.busy; onClicked: root.swap() }
@@ -706,18 +799,14 @@ Item {
             model: root.targetLanguages().map(function(x) { return x[1] })
             currentIndex: 1
             onEditTextChanged: {
+              if (root.syncingLanguageSelectors) return
               var match = find(editText, Qt.MatchContains)
               if (match >= 0) currentIndex = match
             }
-            onActivated: {
-              root.targetLanguage = root.targetLanguages()[currentIndex][0]
-              root.syncLanguageSelectors()
-              root.saveLanguages()
-            }
+            onActivated: root.selectTargetLanguage(currentIndex)
             onAccepted: {
-              root.targetLanguage = root.targetLanguages()[currentIndex][0]
-              root.syncLanguageSelectors()
-              root.saveLanguages()
+              var exact = root.exactLanguageIndex(root.targetLanguages(), editText)
+              root.selectTargetLanguage(exact >= 0 ? exact : currentIndex)
             }
           }
         }

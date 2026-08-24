@@ -41,11 +41,13 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertFalse(result["data"]["showHotkeys"])
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"]["translate"], "Ctrl+Enter")
   def test_translation_context_preferences(self):
+    self.assertTrue(qt.preferences_set({"sourceLanguage": "ja", "targetLanguage": "en"})["ok"])
     contexts = [{"id": "formal-ja", "name": "Formal Japanese", "instruction": "Use formal Japanese."}]
     result = qt.preferences_set({"translationContexts": contexts, "selectedContextId": "formal-ja"})
     self.assertTrue(result["ok"])
     self.assertEqual(result["data"]["translationContexts"], contexts)
     self.assertEqual(result["data"]["selectedContextId"], "formal-ja")
+    self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("ja", "en"))
     self.assertEqual(qt.preferences_set({"selectedContextId": "missing"})["error"]["code"], "invalid_context")
     self.assertEqual(qt.preferences_set({"translationContexts": [{"id": "bad id", "name": "x", "instruction": "y"}]})["error"]["code"], "invalid_context")
     duplicate = contexts + [{"id": "casual-ja", "name": "formal japanese", "instruction": "Use casual Japanese."}]
@@ -176,17 +178,12 @@ class QuickTranslateTests(unittest.TestCase):
   def test_clipboard_success_does_not_capture_forked_wl_copy_streams(self, run):
     run.return_value.returncode = 0
     self.assertTrue(qt.copy_text({"text":"x"})["ok"])
+    self.assertEqual(run.call_args.args[0], ["wl-copy"])
+    self.assertEqual(run.call_args.kwargs["input"], "x")
+    self.assertTrue(run.call_args.kwargs["text"])
+    self.assertEqual(run.call_args.kwargs["timeout"], 5)
     self.assertEqual(run.call_args.kwargs["stdout"], qt.subprocess.DEVNULL)
     self.assertEqual(run.call_args.kwargs["stderr"], qt.subprocess.DEVNULL)
-  def test_clipboard_formats(self):
-    self.assertEqual("translated", "translated")
-    self.assertEqual("source" + "\n\n" + "translated", "source\n\ntranslated")
-  def test_swap_populated_empty_and_multiline(self):
-    def swap(source_language, target_language, source, output):
-      return target_language, source_language, output, source
-    self.assertEqual(swap("en", "ja", "hello", "こんにちは"), ("ja", "en", "こんにちは", "hello"))
-    self.assertEqual(swap("en", "ja", "", ""), ("ja", "en", "", ""))
-    self.assertEqual(swap("en", "ja", "one\ntwo", "一\n二"), ("ja", "en", "一\n二", "one\ntwo"))
   def test_single_request_stdio_protocol_exits_without_eof(self):
     request = json.dumps({"operation":"preferences.get", "params":{}}) + "\nignored\n"
     process = subprocess.Popen(
@@ -290,6 +287,31 @@ class QuickTranslateTests(unittest.TestCase):
     open_function = qml.split("function open(payload)", 1)[1].split("function close()", 1)[0]
     self.assertIn("setupOpen = false", open_function)
     self.assertIn("opened = true", open_function)
+  def test_qml_queues_operations_and_applies_only_saved_preference_fields(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    self.assertIn("pendingOperations = pendingOperations.concat", qml)
+    self.assertIn("function startNextOperation()", qml)
+    self.assertIn("root.startNextOperation()", qml)
+    self.assertIn("function applyPreferenceResult(params, data)", qml)
+    self.assertIn("applyPreferenceResult(params, reply.data)", qml)
+    self.assertIn('code: "helper_failed"', qml)
+    self.assertIn("if (callback)", qml)
+    self.assertNotIn("else if (callback)", qml)
+  def test_qml_discards_a_translation_when_its_inputs_change(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    matcher = qml.split("function translationRequestIsCurrent(request)", 1)[1].split("function applyPreferences", 1)[0]
+    for field in ("text", "translator", "sourceLanguage", "targetLanguage", "selectedContextId", "openaiReasoningEffort"):
+      self.assertIn("request." + field, matcher)
+    translate_function = qml.split("function translate()", 1)[1].split("function swap()", 1)[0]
+    self.assertIn("if (!translationRequestIsCurrent(request))", translate_function)
+    self.assertIn("Translation discarded because the text or settings changed.", translate_function)
+  def test_qml_commits_displayed_languages_before_translation(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    self.assertIn("function commitDisplayedLanguages()", qml)
+    translate_function = qml.split("function translate()", 1)[1].split("function swap()", 1)[0]
+    self.assertIn("if (commitDisplayedLanguages()) saveLanguages()", translate_function)
+    self.assertIn("onActivated: root.selectSourceLanguage(currentIndex)", qml)
+    self.assertIn("onActivated: root.selectTargetLanguage(currentIndex)", qml)
   def test_bar_widget_uses_matching_icon(self):
     qml = (HERE / "BarWidget.qml").read_text()
     self.assertIn('text: "󰗊"', qml)
