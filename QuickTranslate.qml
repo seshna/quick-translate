@@ -496,7 +496,14 @@ Item {
     clearUndoAvailable = false
     sourceBox.forceActiveFocus()
   }
-  function open(payload) { opened = true; Qt.callLater(function(){ sourceBox.forceActiveFocus() }) }
+  function open(payload) {
+    setupOpen = false
+    recordingAction = ""
+    settingsError = ""
+    resetConfirmationVisible = false
+    opened = true
+    Qt.callLater(function(){ sourceBox.forceActiveFocus() })
+  }
   function close() { opened = false }
   function dismiss() { opened = false; if (shell) shell.hide((manifest && manifest.id) || "shaun.quick-translate") }
   function toggle() { opened ? dismiss() : open("{}") }

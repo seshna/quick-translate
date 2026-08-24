@@ -285,6 +285,11 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"', qml)
     self.assertIn('compactActionText: root.translating ? "󰗊 …" : "󰗊"', qml)
     self.assertIn('!control.showHotkey ? (control.compactActionText !== "" ? control.compactActionText : control.actionText)', qml)
+  def test_qml_reopens_on_the_main_translation_page(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    open_function = qml.split("function open(payload)", 1)[1].split("function close()", 1)[0]
+    self.assertIn("setupOpen = false", open_function)
+    self.assertIn("opened = true", open_function)
   def test_bar_widget_uses_matching_icon(self):
     qml = (HERE / "BarWidget.qml").read_text()
     self.assertIn('text: "󰗊"', qml)
