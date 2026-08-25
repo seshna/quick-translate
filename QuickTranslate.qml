@@ -35,8 +35,12 @@ Item {
   property int profileSelectedIndex: 0
   property string profileDeleteConfirmationId: ""
   property string profilesError: ""
-  property string editingContextId: ""
+  property bool contextsOpen: false
   property bool contextEditorOpen: false
+  property int contextSelectedIndex: 0
+  property string contextDeleteConfirmationId: ""
+  property string contextsError: ""
+  property string editingContextId: ""
   property bool setupOpen: false
   property int settingsSelectedIndex: 0
   property string recordingAction: ""
@@ -410,15 +414,104 @@ Item {
     selectedContextId = value
     savePreferences({selectedContextId: value})
   }
-  function cycleContext() {
-    if (!usesLlm() || busy) return
-    var options = contextOptions()
-    if (options.length === 0) return
-    var nextIndex = (contextIndex(selectedContextId) + 1) % options.length
-    setSelectedContext(options[nextIndex].id)
+  function openContexts() {
+    if (!usesLlm()) return
+    setupOpen = false
+    profilesOpen = false
+    contextsOpen = true
+    contextEditorOpen = false
+    contextSelectedIndex = 0
+    contextDeleteConfirmationId = ""
+    contextsError = ""
+    Qt.callLater(function() { newContextButton.forceActiveFocus() })
+  }
+  function closeContexts() {
+    contextsOpen = false
+    contextEditorOpen = false
+    contextSelectedIndex = 0
+    contextDeleteConfirmationId = ""
+    contextsError = ""
+    Qt.callLater(function() { sourceBox.forceActiveFocus() })
+  }
+  function startNewContext() {
+    if (translationContexts.length >= 20) { contextsError = "Keep at most 20 contexts."; return }
+    editingContextId = ""
+    contextEditorOpen = true
+    contextDeleteConfirmationId = ""
+    contextsError = ""
+    contextNameField.text = ""
+    contextInstructionField.text = ""
+    Qt.callLater(function() { contextNameField.forceActiveFocus() })
+  }
+  function editContext(id) {
+    var context = contextForId(id)
+    if (!context) return
+    editingContextId = context.id
+    contextEditorOpen = true
+    contextDeleteConfirmationId = ""
+    contextsError = ""
+    contextNameField.text = context.name
+    contextInstructionField.text = context.instruction
+    Qt.callLater(function() { contextNameField.forceActiveFocus() })
+  }
+  function selectContext(id) {
+    if (id !== "" && !contextForId(id)) return
+    setSelectedContext(id)
+    closeContexts()
+  }
+  function saveContext() {
+    var name = contextNameField.text.trim()
+    var instruction = contextInstructionField.text.trim()
+    if (name === "" || instruction === "") { contextsError = "Give the context both a name and an instruction."; return }
+    if (commitDisplayedLanguages()) saveLanguages()
+    var id = editingContextId === "" ? newContextId() : editingContextId
+    var contexts = []
+    for (var i = 0; i < translationContexts.length; i++)
+      if (translationContexts[i].id !== id) contexts.push(translationContexts[i])
+    contexts.push({id: id, name: name, instruction: instruction})
+    selectedContextId = id
+    savePreferences({translationContexts: contexts, selectedContextId: id}, function(reply) {
+      if (reply && reply.ok) {
+        contextEditorOpen = false
+        contextSelectedIndex = 3 + translationContexts.findIndex(function(context) { return context.id === id }) * 3
+        contextsError = ""
+      } else contextsError = reply && reply.error ? reply.error.message : "Could not save translation context."
+    })
+  }
+  function removeContext(id) {
+    if (contextDeleteConfirmationId !== id) { contextDeleteConfirmationId = id; return }
+    var contexts = translationContexts.filter(function(context) { return context.id !== id })
+    var nextSelectedId = selectedContextId === id ? "" : selectedContextId
+    savePreferences({translationContexts: contexts, selectedContextId: nextSelectedId}, function(reply) {
+      if (reply && reply.ok) {
+        contextDeleteConfirmationId = ""
+        contextSelectedIndex = Math.min(contextSelectedIndex, 2 + translationContexts.length * 3)
+        contextsError = ""
+      } else contextsError = reply && reply.error ? reply.error.message : "Could not remove translation context."
+    })
+  }
+  function moveContextSelection(direction) {
+    if (!contextsOpen || contextEditorOpen) return
+    var count = 3 + translationContexts.length * 3
+    contextSelectedIndex = (contextSelectedIndex + direction + count) % count
+    Qt.callLater(function() {
+      if (contextSelectedIndex === 0) newContextButton.forceActiveFocus()
+      else if (contextSelectedIndex === 1) backContextButton.forceActiveFocus()
+      else if (contextSelectedIndex === 2) noContextButton.forceActiveFocus()
+      else {
+        var contextIndex = Math.floor((contextSelectedIndex - 3) / 3)
+        var item = contextRepeater.itemAt(contextIndex)
+        if (!item) return
+        var action = (contextSelectedIndex - 3) % 3
+        if (action === 0 && item.selectButton) item.selectButton.forceActiveFocus()
+        else if (action === 1 && item.editButton) item.editButton.forceActiveFocus()
+        else if (action === 2 && item.deleteButton) item.deleteButton.forceActiveFocus()
+      }
+    })
   }
   function openProfiles() {
     setupOpen = false
+    contextsOpen = false
     profilesOpen = true
     creatingProfile = false
     profileSelectedIndex = 0
@@ -493,49 +586,10 @@ Item {
   function selectedProfile() {
     return profileSelectedIndex >= 2 ? profiles[Math.floor((profileSelectedIndex - 2) / 2)] : null
   }
-  function startNewContext() {
-    editingContextId = ""
-    contextNameField.text = ""
-    contextInstructionField.text = ""
-    contextNameField.forceActiveFocus()
-  }
-  function loadContextForEditing(value) {
-    var context = contextForId(value)
-    editingContextId = context ? context.id : ""
-    contextNameField.text = context ? context.name : ""
-    contextInstructionField.text = context ? context.instruction : ""
-  }
-  function saveContext() {
-    var name = contextNameField.text.trim()
-    var instruction = contextInstructionField.text.trim()
-    if (name === "" || instruction === "") { settingsError = "Give the context both a name and an instruction."; return }
-    var id = editingContextId === "" ? newContextId() : editingContextId
-    var contexts = []
-    for (var i = 0; i < translationContexts.length; i++)
-      if (translationContexts[i].id !== id) contexts.push(translationContexts[i])
-    contexts.push({id: id, name: name, instruction: instruction})
-    selectedContextId = id
-    editingContextId = id
-    savePreferences({translationContexts: contexts, selectedContextId: id}, function(reply) {
-      if (reply && reply.ok) { settingsError = ""; loadContextForEditing(id) }
-      else settingsError = reply && reply.error ? reply.error.message : "Could not save translation context."
-    })
-  }
-  function removeContext() {
-    if (editingContextId === "") return
-    var id = editingContextId
-    var contexts = translationContexts.filter(function(context) { return context.id !== id })
-    selectedContextId = selectedContextId === id ? "" : selectedContextId
-    startNewContext()
-    savePreferences({translationContexts: contexts, selectedContextId: selectedContextId}, function(reply) {
-      if (reply && reply.ok) settingsError = ""
-      else settingsError = reply && reply.error ? reply.error.message : "Could not remove translation context."
-    })
-  }
   function setTranslator(value) {
     if (!engineFor(value)) return
     translator = value
-    if (!usesLlm()) contextEditorOpen = false
+    if (!usesLlm() && contextsOpen) closeContexts()
     if (settingsControls[settingsSelectedIndex] && !settingsControls[settingsSelectedIndex].visible)
       settingsSelectedIndex = 0
     normalizeLanguagePair()
@@ -596,6 +650,7 @@ Item {
   }
   function openSetup() {
     profilesOpen = false
+    contextsOpen = false
     setupOpen = true
     settingsSelectedIndex = 0
     recordingAction = ""
@@ -622,7 +677,7 @@ Item {
   }
   function focusMainSelection() {
     Qt.callLater(function() {
-      if (!opened || setupOpen || profilesOpen) return
+      if (!opened || setupOpen || profilesOpen || contextsOpen) return
       var control = mainControls[mainSelectedIndex]
       if (!control) return
       if (typeof control.focusControl === "function") control.focusControl()
@@ -645,7 +700,7 @@ Item {
     })
   }
   function canPerform(action) {
-    if (setupOpen || profilesOpen) return false
+    if (setupOpen || profilesOpen || contextsOpen) return false
     if (action === "switch") return !busy
     if (action === "translate") return canTranslate
     if (action === "undo") return clearUndoAvailable && !busy
@@ -737,6 +792,7 @@ Item {
   function open(payload) {
     setupOpen = false
     profilesOpen = false
+    contextsOpen = false
     creatingProfile = false
     profileDeleteConfirmationId = ""
     profilesError = ""
@@ -752,7 +808,7 @@ Item {
   function toggle() { opened ? dismiss() : open("{}") }
 
   Component.onCompleted: {
-    mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextPicker, clearButton, copyButton, copyAllButton, translateButton]
+    mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextButton, clearButton, copyButton, copyAllButton, translateButton]
     settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton, barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton]
     run("engines.get", {}, function(reply) {
       if (reply && reply.ok) engines = reply.data || []
@@ -869,14 +925,14 @@ Item {
     Shortcut {
       sequence: "Ctrl+Shift+P"
       context: Qt.WindowShortcut
-      enabled: root.opened && root.recordingAction === ""
+      enabled: root.opened && !root.contextsOpen && root.recordingAction === ""
       onActivated: root.profilesOpen ? root.closeProfiles() : root.openProfiles()
     }
     Shortcut {
       sequence: "Ctrl+Shift+X"
       context: Qt.WindowShortcut
       enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.usesLlm() && !root.busy
-      onActivated: root.cycleContext()
+      onActivated: root.contextsOpen ? root.closeContexts() : root.openContexts()
     }
     Shortcut {
       sequence: "Ctrl+J"
@@ -893,6 +949,18 @@ Item {
     Shortcut {
       sequence: "Ctrl+J"
       context: Qt.WindowShortcut
+      enabled: root.contextsOpen && !root.contextEditorOpen && root.recordingAction === ""
+      onActivated: root.moveContextSelection(1)
+    }
+    Shortcut {
+      sequence: "Ctrl+K"
+      context: Qt.WindowShortcut
+      enabled: root.contextsOpen && !root.contextEditorOpen && root.recordingAction === ""
+      onActivated: root.moveContextSelection(-1)
+    }
+    Shortcut {
+      sequence: "Ctrl+J"
+      context: Qt.WindowShortcut
       enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""
       onActivated: root.moveProfileSelection(1)
     }
@@ -905,13 +973,13 @@ Item {
     Shortcut {
       sequence: "Ctrl+J"
       context: Qt.WindowShortcut
-      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.recordingAction === ""
       onActivated: root.moveMainSelection(1)
     }
     Shortcut {
       sequence: "Ctrl+K"
       context: Qt.WindowShortcut
-      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.recordingAction === ""
       onActivated: root.moveMainSelection(-1)
     }
     Rectangle { anchors.fill: parent; color: Color.menu.scrim }
@@ -930,12 +998,18 @@ Item {
       Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Escape && root.recordingAction === "") {
           if (root.profilesOpen) root.closeProfiles()
+          else if (root.contextsOpen) root.closeContexts()
           else if (root.setupOpen) root.closeSetup()
           else root.dismiss()
           event.accepted = true
         }
         else if (root.profilesOpen && !root.creatingProfile && event.key === Qt.Key_Delete && root.selectedProfile()) {
           root.removeProfile(root.selectedProfile().id)
+          event.accepted = true
+        }
+        else if (root.contextsOpen && !root.contextEditorOpen && event.key === Qt.Key_Delete && root.contextSelectedIndex >= 3) {
+          var item = root.translationContexts[Math.floor((root.contextSelectedIndex - 3) / 3)]
+          if (item) root.removeContext(item.id)
           event.accepted = true
         }
         else if (root.handleActionShortcut(event)) event.accepted = true
@@ -958,14 +1032,14 @@ Item {
         RowLayout {
           Layout.fillWidth: true
           Label { text: "󰗊"; color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading * 1.35; font.bold: true }
-          Label { text: root.profilesOpen ? "Translation Profiles" : (root.setupOpen ? "Quick Translate Setup" : "Quick Translate"); color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
+          Label { text: root.profilesOpen ? "Translation Profiles" : (root.contextsOpen ? "Translation Contexts" : (root.setupOpen ? "Quick Translate Setup" : "Quick Translate")); color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
           Button {
-            visible: !root.setupOpen && !root.profilesOpen
+            visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
             text: root.showHotkeys ? "󰀻  Ctrl+Shift+P" : "󰀻"
             onClicked: root.openProfiles()
           }
           Button {
-            visible: !root.profilesOpen
+            visible: !root.profilesOpen && !root.contextsOpen
             text: root.setupOpen ? (root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍") : (!root.showHotkeys ? "󰒓" : "󰒓  Ctrl+?")
             onClicked: root.setupOpen ? root.closeSetup() : root.openSetup()
           }
@@ -975,7 +1049,7 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen
+          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
           Layout.fillWidth: true
           ComboBox {
             id: fromPicker
@@ -1021,7 +1095,7 @@ Item {
         }
         Item { Layout.preferredHeight: Style.spacing.md }
         ScrollView {
-          visible: !root.setupOpen && !root.profilesOpen
+          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           TextArea {
@@ -1052,27 +1126,19 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen
+          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
           Layout.fillWidth: true
           Item { Layout.fillWidth: true }
           Label { visible: root.showHotkeys; text: "Ctrl+J/K select"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           Label { text: root.activeTranslatorLabel(); color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
           Label { visible: root.usesLlm() && root.showHotkeys; text: "Ctrl+Shift+X"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
-          ComboBox {
-            id: contextPicker
+          HotkeyButton {
+            id: contextButton
             visible: root.usesLlm()
-            Layout.preferredWidth: 260
-            model: root.contextOptions()
-            textRole: "label"
-            currentIndex: root.contextIndex(root.selectedContextId)
-            delegate: MenuItem {
-              required property var model
-              required property int index
-              width: ListView.view.width
-              text: model.label
-              highlighted: contextPicker.highlightedIndex === index
-            }
-            onActivated: root.setSelectedContext(root.contextOptions()[currentIndex].id)
+            actionText: root.profileContextLabel(root.selectedContextId)
+            compactActionText: root.profileContextLabel(root.selectedContextId)
+            available: !root.busy
+            onClicked: root.openContexts()
           }
           ComboBox {
             id: openaiReasoningPicker
@@ -1092,15 +1158,15 @@ Item {
           Label { text: sourceBox.text.length + " / " + root.maxChars.toLocaleString(); color: sourceBox.text.length > root.maxChars ? "#e06c75" : Color.menu.text; opacity: .75 }
         }
         ScrollView {
-          visible: !root.setupOpen && !root.profilesOpen
+          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           opacity: .55
           TextArea { id: outputBox; text: root.translating ? "Translating…" : root.translatedText; readOnly: true; placeholderText: root.showHotkeys ? root.shortcut("translate") + " to translate" : "Translation"; wrapMode: TextEdit.Wrap; selectByMouse: true; color: Color.menu.text; font.family: Style.font.menuFamily }
         }
-        Label { visible: !root.setupOpen && !root.profilesOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+        Label { visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen
+          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
           Layout.fillWidth: true
           HotkeyButton { id: clearButton; actionText: "󰆴  Clear"; compactActionText: "󰆴"; hotkeyText: root.shortcut("clear"); reservedText: "󰆴  Clear  " + root.shortcut("clear"); available: !root.busy && (sourceBox.text.length > 0 || root.translatedText.length > 0); visuallyMuted: sourceBox.text.length === 0 && root.translatedText.length === 0; onClicked: root.clearAll() }
           HotkeyButton { id: copyButton; actionText: root.copiedAction === "translation" ? "󰆏  Copied ✓" : "󰆏  Copy translation"; compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"; hotkeyText: root.copiedAction === "translation" ? "" : root.shortcut("copy"); reservedText: "󰆏  Copy translation  " + root.shortcut("copy"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(root.translatedText, "translation") }
@@ -1119,6 +1185,14 @@ Item {
             opacity: .80
             wrapMode: Text.WordWrap
             font.family: Style.font.menuFamily
+          }
+          Label {
+            visible: root.showHotkeys && !root.creatingProfile
+            text: "Ctrl+J/K select · Enter load/create · Delete remove"
+            color: Color.menu.text
+            opacity: .65
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.caption
           }
           RowLayout {
             Layout.fillWidth: true
@@ -1194,14 +1268,6 @@ Item {
             opacity: .75
             font.family: Style.font.menuFamily
           }
-          Label {
-            visible: root.showHotkeys
-            text: "Ctrl+J/K select · Enter load/create · Delete remove"
-            color: Color.menu.text
-            opacity: .65
-            font.family: Style.font.menuFamily
-            font.pixelSize: Style.font.caption
-          }
           Repeater {
             id: profileRepeater
             model: root.profiles
@@ -1266,6 +1332,194 @@ Item {
           }
         }
         ColumnLayout {
+          visible: root.contextsOpen
+          Layout.fillWidth: true
+          spacing: Style.spacing.md
+          Label {
+            Layout.fillWidth: true
+            text: "Contexts guide Gemma locally and are sent to OpenAI when it is selected."
+            color: Color.menu.text
+            opacity: .80
+            wrapMode: Text.WordWrap
+            font.family: Style.font.menuFamily
+          }
+          Label {
+            visible: root.showHotkeys && !root.contextEditorOpen
+            text: "Ctrl+J/K select · Enter select/edit · Delete remove"
+            color: Color.menu.text
+            opacity: .65
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.caption
+          }
+          RowLayout {
+            visible: !root.contextEditorOpen
+            Layout.fillWidth: true
+            Label { text: root.contextSelectedIndex === 0 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Button {
+              id: newContextButton
+              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 0
+              focusable: true
+              text: "New context"
+              bordered: true
+              enabled: !root.busy && root.translationContexts.length < 20
+              onClicked: root.startNewContext()
+              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 0
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.startNewContext(); event.accepted = true }
+              }
+            }
+            Item { Layout.fillWidth: true }
+            Label { text: root.contextSelectedIndex === 1 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Button {
+              id: backContextButton
+              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 1
+              focusable: true
+              text: "Back"
+              bordered: true
+              onClicked: root.closeContexts()
+              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 1
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.closeContexts(); event.accepted = true }
+              }
+            }
+          }
+          RowLayout {
+            visible: !root.contextEditorOpen
+            Layout.fillWidth: true
+            Label { text: root.contextSelectedIndex === 2 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
+            Button {
+              id: noContextButton
+              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 2
+              focusable: true
+              Layout.fillWidth: true
+              text: "No context"
+              bordered: true
+              enabled: !root.busy
+              onClicked: root.selectContext("")
+              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 2
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.selectContext(""); event.accepted = true }
+              }
+            }
+          }
+          ColumnLayout {
+            visible: root.contextEditorOpen
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+            Label { text: root.editingContextId === "" ? "New context" : "Edit context"; color: Color.menu.text; font.family: Style.font.menuFamily; font.bold: true }
+            RowLayout {
+              Layout.fillWidth: true
+              Label { text: "Name"; color: Color.menu.text; Layout.preferredWidth: 120 }
+              TextField {
+                id: contextNameField
+                Layout.fillWidth: true
+                placeholderText: "e.g. Formal Japanese"
+                maximumLength: 64
+                onAccepted: root.saveContext()
+              }
+            }
+            Label { text: "Instruction"; color: Color.menu.text; Layout.fillWidth: true }
+            ScrollView {
+              Layout.fillWidth: true
+              Layout.preferredHeight: 120
+              TextArea {
+                id: contextInstructionField
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                color: Color.menu.text
+                font.family: Style.font.menuFamily
+                placeholderText: "e.g. Use polite Japanese and preserve product names."
+                onTextChanged: if (text.length > 2000) text = text.slice(0, 2000)
+              }
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              Item { Layout.fillWidth: true }
+              Button { text: "Save context"; bordered: true; enabled: !root.busy; onClicked: root.saveContext() }
+              Button { text: "Cancel"; bordered: true; onClicked: { root.contextEditorOpen = false; root.contextsError = ""; Qt.callLater(function() { root.moveContextSelection(0) }) } }
+            }
+          }
+          Label {
+            visible: root.translationContexts.length === 0 && !root.contextEditorOpen
+            text: "No contexts saved yet."
+            color: Color.menu.text
+            opacity: .75
+            font.family: Style.font.menuFamily
+          }
+          Repeater {
+            id: contextRepeater
+            model: root.contextEditorOpen ? [] : root.translationContexts
+            delegate: RowLayout {
+              required property var modelData
+              required property int index
+              property var selectButton: savedContextSelectButton
+              property var editButton: savedContextEditButton
+              property var deleteButton: savedContextDeleteButton
+              Layout.fillWidth: true
+              spacing: Style.spacing.sm
+              Label {
+                text: root.contextSelectedIndex >= 3 + index * 3 && root.contextSelectedIndex <= 5 + index * 3 ? "󰁔" : ""
+                color: Color.menu.text
+                font.family: Style.font.menuFamily
+                Layout.preferredWidth: Style.space(16)
+              }
+              Button {
+                id: savedContextSelectButton
+                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 3 + index * 3
+                focusable: true
+                Layout.fillWidth: true
+                text: modelData.name
+                bordered: true
+                enabled: !root.busy
+                onClicked: root.selectContext(modelData.id)
+                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 3 + index * 3
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.selectContext(modelData.id); event.accepted = true }
+                }
+              }
+              Button {
+                id: savedContextEditButton
+                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 4 + index * 3
+                focusable: true
+                text: "Edit"
+                bordered: true
+                enabled: !root.busy
+                onClicked: root.editContext(modelData.id)
+                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 4 + index * 3
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.editContext(modelData.id); event.accepted = true }
+                }
+              }
+              Button {
+                id: savedContextDeleteButton
+                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 5 + index * 3
+                focusable: true
+                text: root.contextDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"
+                bordered: true
+                enabled: !root.busy
+                onClicked: root.removeContext(modelData.id)
+                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 5 + index * 3
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.removeContext(modelData.id); event.accepted = true }
+                }
+              }
+            }
+          }
+          Label {
+            visible: root.contextsError !== ""
+            Layout.fillWidth: true
+            text: root.contextsError
+            color: "#e06c75"
+            wrapMode: Text.WordWrap
+          }
+        }
+        ColumnLayout {
           visible: root.setupOpen
           Layout.fillWidth: true
           Layout.fillHeight: true
@@ -1325,78 +1579,6 @@ Item {
             wrapMode: Text.WordWrap
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.caption
-          }
-          Button {
-            visible: root.usesLlm()
-            Layout.fillWidth: true
-            bordered: true
-            text: (root.contextEditorOpen ? "󰅂" : "󰅀") + "  Translation contexts"
-            onClicked: root.contextEditorOpen = !root.contextEditorOpen
-          }
-          ColumnLayout {
-            visible: root.usesLlm() && root.contextEditorOpen
-            Layout.fillWidth: true
-            spacing: Style.spacing.sm
-            Label {
-              Layout.fillWidth: true
-              text: "Contexts guide Gemma locally and are sent to OpenAI when it is selected."
-              color: Color.menu.text
-              opacity: .80
-              wrapMode: Text.WordWrap
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.caption
-            }
-            RowLayout {
-              Layout.fillWidth: true
-              Label { text: "Saved context"; color: Color.menu.text; Layout.fillWidth: true }
-              ComboBox {
-                id: contextEditorPicker
-                Layout.preferredWidth: 260
-                model: root.contextOptions()
-                textRole: "label"
-                currentIndex: root.contextIndex(root.editingContextId)
-                delegate: MenuItem {
-                  required property var model
-                  required property int index
-                  width: ListView.view.width
-                  text: model.label
-                  highlighted: contextEditorPicker.highlightedIndex === index
-                }
-                onActivated: root.loadContextForEditing(root.contextOptions()[currentIndex].id)
-              }
-              Button { text: "New"; bordered: true; onClicked: root.startNewContext() }
-            }
-            RowLayout {
-              Layout.fillWidth: true
-              Label { text: "Name"; color: Color.menu.text; Layout.preferredWidth: 120 }
-              TextField {
-                id: contextNameField
-                Layout.fillWidth: true
-                placeholderText: "e.g. Formal Japanese"
-                maximumLength: 64
-                onAccepted: root.saveContext()
-              }
-            }
-            Label { text: "Instruction"; color: Color.menu.text; Layout.fillWidth: true }
-            ScrollView {
-              Layout.fillWidth: true
-              Layout.preferredHeight: 96
-              TextArea {
-                id: contextInstructionField
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                color: Color.menu.text
-                font.family: Style.font.menuFamily
-                placeholderText: "e.g. Use polite Japanese and preserve product names."
-                onTextChanged: if (text.length > 2000) text = text.slice(0, 2000)
-              }
-            }
-            RowLayout {
-              Layout.fillWidth: true
-              Item { Layout.fillWidth: true }
-              Button { text: "Save context"; bordered: true; onClicked: root.saveContext() }
-              Button { text: "Remove"; bordered: true; enabled: root.editingContextId !== ""; onClicked: root.removeContext() }
-            }
           }
           RowLayout {
             visible: root.translator === "openai"

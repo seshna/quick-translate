@@ -47,7 +47,7 @@ Disable and remove the plugin with:
 - Clear both text boxes and undo the clear
 - A matching Omarchy bar launcher that can be hidden from Setup
 - Reconfigurable action shortcuts, recorded directly from the keyboard
-- Optional shortcut hints on the main page, `Ctrl+?` to open Setup, `Ctrl+Shift+P` for profiles, and `Ctrl+Shift+X` to cycle contexts
+- Optional shortcut hints on the main page, `Ctrl+?` to open Setup, `Ctrl+Shift+P` for profiles, and `Ctrl+Shift+X` for the context manager
 - Up to 5,000 input characters.
 
 ## Shortcuts
@@ -62,7 +62,7 @@ Disable and remove the plugin with:
 | Ctrl+Z | Undo the most recent Clear (configurable) |
 | Ctrl+? | Open Setup |
 | Ctrl+Shift+P | Open translation profiles |
-| Ctrl+Shift+X | Cycle translation contexts (Ollama/OpenAI) |
+| Ctrl+Shift+X | Open translation contexts (Ollama/OpenAI) |
 | Escape | Close the overlay |
 
 

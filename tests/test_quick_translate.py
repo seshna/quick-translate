@@ -52,6 +52,20 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(qt.preferences_set({"translationContexts": [{"id": "bad id", "name": "x", "instruction": "y"}]})["error"]["code"], "invalid_context")
     duplicate = contexts + [{"id": "casual-ja", "name": "formal japanese", "instruction": "Use casual Japanese."}]
     self.assertEqual(qt.preferences_set({"translationContexts": duplicate})["error"]["code"], "invalid_context")
+  def test_editing_or_removing_contexts_preserves_languages(self):
+    self.assertTrue(qt.preferences_set({"sourceLanguage": "de", "targetLanguage": "en"})["ok"])
+    contexts = [
+      {"id": "formal", "name": "Formal", "instruction": "Use formal wording."},
+      {"id": "casual", "name": "Casual", "instruction": "Use casual wording."},
+    ]
+    self.assertTrue(qt.preferences_set({"translationContexts": contexts, "selectedContextId": "formal"})["ok"])
+    edited = [{"id": "formal", "name": "Formal", "instruction": "Preserve honorifics."}, contexts[1]]
+    result = qt.preferences_set({"translationContexts": edited, "selectedContextId": "formal"})
+    self.assertTrue(result["ok"])
+    self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("de", "en"))
+    result = qt.preferences_set({"translationContexts": [edited[0]], "selectedContextId": ""})
+    self.assertTrue(result["ok"])
+    self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("de", "en"))
   def test_profile_preferences_and_deleted_context_references(self):
     profile = {"id": "formal-ja", "name": "Formal Japanese", "translator": "openai",
                "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "formal-context"}
@@ -244,10 +258,9 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertNotIn('How translation works', qml)
     self.assertIn('Google, Apertium, Bing, Reverso, Ollama Local, or OpenAI', qml)
     self.assertIn('id: openaiReasoningPicker', qml)
-    self.assertIn('id: contextPicker', qml)
-    self.assertIn('id: contextEditorPicker', qml)
-    self.assertIn('text: (root.contextEditorOpen ? "󰅂" : "󰅀") + "  Translation contexts"', qml)
-    self.assertIn('visible: root.usesLlm() && root.contextEditorOpen', qml)
+    self.assertIn('id: contextButton', qml)
+    self.assertIn('function openContexts()', qml)
+    self.assertIn('function moveContextSelection(direction)', qml)
     self.assertIn('function saveContext()', qml)
     self.assertIn('label: root.reasoningEffortLabel(effort)', qml)
     self.assertIn('function activeTranslatorLabel()', qml)
@@ -257,8 +270,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('sequence: "Ctrl+?"', qml)
     self.assertIn('sequence: "Ctrl+Shift+P"', qml)
     self.assertIn('sequence: "Ctrl+Shift+X"', qml)
-    self.assertIn('function cycleContext()', qml)
-    self.assertIn('onActivated: root.cycleContext()', qml)
+    self.assertIn('onActivated: root.contextsOpen ? root.closeContexts() : root.openContexts()', qml)
     self.assertIn('"󰒓  Ctrl+?"', qml)
     self.assertIn('"󰁍  Ctrl+?"', qml)
     self.assertIn('root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍"', qml)
@@ -268,7 +280,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertNotIn('Enter or Space change', qml)
     self.assertIn('settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton', qml)
-    self.assertIn('mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextPicker, clearButton, copyButton, copyAllButton, translateButton]', qml)
+    self.assertIn('mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextButton, clearButton, copyButton, copyAllButton, translateButton]', qml)
     self.assertIn('function moveMainSelection(direction)', qml)
     self.assertIn('function focusMainSelection()', qml)
     self.assertIn('onActivated: root.moveMainSelection(1)', qml)
@@ -309,6 +321,21 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"', qml)
     self.assertIn('compactActionText: root.translating ? "󰗊 …" : "󰗊"', qml)
     self.assertIn('!control.showHotkey ? (control.compactActionText !== "" ? control.compactActionText : control.actionText)', qml)
+  def test_qml_context_manager_selects_edits_and_deletes(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    for function in ("function openContexts()", "function startNewContext()", "function editContext(id)", "function selectContext(id)", "function saveContext()", "function removeContext(id)"):
+      self.assertIn(function, qml)
+    self.assertIn('id: newContextButton', qml)
+    self.assertIn('id: backContextButton', qml)
+    self.assertIn('id: noContextButton', qml)
+    self.assertIn('id: savedContextSelectButton', qml)
+    self.assertIn('id: savedContextEditButton', qml)
+    self.assertIn('id: savedContextDeleteButton', qml)
+    self.assertIn('text: root.contextDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"', qml)
+    self.assertIn('root.selectContext("")', qml)
+    self.assertIn('root.moveContextSelection(1)', qml)
+    self.assertIn('root.moveContextSelection(-1)', qml)
+    self.assertIn('if (commitDisplayedLanguages()) saveLanguages()', qml)
   def test_qml_profiles_create_load_and_delete(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     for function in ("function openProfiles()", "function startNewProfile()", "function saveProfile()", "function loadProfile(id)", "function removeProfile(id)"):
