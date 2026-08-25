@@ -29,6 +29,12 @@ Item {
   property string openaiReasoningEffort: "minimal"
   property var translationContexts: []
   property string selectedContextId: ""
+  property var profiles: []
+  property bool profilesOpen: false
+  property bool creatingProfile: false
+  property int profileSelectedIndex: 0
+  property string profileDeleteConfirmationId: ""
+  property string profilesError: ""
   property string editingContextId: ""
   property bool contextEditorOpen: false
   property bool setupOpen: false
@@ -42,6 +48,10 @@ Item {
   property string clearedTranslationText: ""
   property bool clearUndoAvailable: false
   property bool restoringClear: false
+  property int preferenceGeneration: 0
+  property var preferenceFieldRevisions: ({})
+  property var mainControls: []
+  property int mainSelectedIndex: 3
   property var settingsControls: []
   readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("quick_translate.py").toString().replace(/^file:\/\//, ""))
   property var languages: []
@@ -70,6 +80,7 @@ Item {
       control.showHotkey ? reservedLabel.implicitWidth + actionButton.horizontalPadding * 2 + 4 : actionButton.implicitWidth
     )
     implicitHeight: actionButton.implicitHeight
+    function focusControl() { actionButton.forceActiveFocus() }
 
     Text {
       id: reservedLabel
@@ -201,6 +212,15 @@ Item {
     return null
   }
   function newContextId() { return "context-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
+  function newProfileId() { return "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
+  function profileForId(id) {
+    for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return profiles[i]
+    return null
+  }
+  function profileContextLabel(id) {
+    var context = contextForId(id)
+    return context ? context.name : "No context"
+  }
   function reasoningEffortLabel(value) { return value.charAt(0).toUpperCase() + value.slice(1) }
   function openaiReasoningEffortIndex() { return openaiReasoningEfforts.indexOf(openaiReasoningEffort) }
   function translatorOptions() {
@@ -318,6 +338,7 @@ Item {
     openaiReasoningEffort = openaiReasoningEfforts.indexOf(data.openaiReasoningEffort) >= 0 ? data.openaiReasoningEffort : "minimal"
     translationContexts = Array.isArray(data.translationContexts) ? data.translationContexts : []
     selectedContextId = contextForId(data.selectedContextId) ? data.selectedContextId : ""
+    profiles = Array.isArray(data.profiles) ? data.profiles : []
     normalizeLanguagePair()
     syncLanguageSelectors()
     syncBarIconVisibility()
@@ -332,12 +353,25 @@ Item {
     }
   }
   function savePreferences(params, done) {
+    preferenceGeneration += 1
+    var responseRevisions = ({})
+    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId", "profiles"]
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i]
+      if (!Object.prototype.hasOwnProperty.call(params, field)) continue
+      preferenceFieldRevisions[field] = (preferenceFieldRevisions[field] || 0) + 1
+      responseRevisions[field] = preferenceFieldRevisions[field]
+    }
+    if (Object.prototype.hasOwnProperty.call(params, "openaiApiKey") || params.clearOpenaiApiKey === true) {
+      preferenceFieldRevisions.openaiApiKey = (preferenceFieldRevisions.openaiApiKey || 0) + 1
+      responseRevisions.openaiApiKey = preferenceFieldRevisions.openaiApiKey
+    }
     run("preferences.set", params, function(reply) {
-      if (showReply(reply) && reply.data) applyPreferenceResult(params, reply.data)
+      if (showReply(reply) && reply.data) applyPreferenceResult(params, reply.data, responseRevisions)
       if (done) done(reply)
     })
   }
-  function applyPreferenceResult(params, data) {
+  function applyPreferenceResult(params, data, responseRevisions) {
     var merged = {
       sourceLanguage: sourceLanguage,
       targetLanguage: targetLanguage,
@@ -348,15 +382,20 @@ Item {
       openaiApiKeyConfigured: openaiApiKeyConfigured,
       openaiReasoningEffort: openaiReasoningEffort,
       translationContexts: translationContexts,
-      selectedContextId: selectedContextId
+      selectedContextId: selectedContextId,
+      profiles: profiles
     }
-    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId"]
+    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId", "profiles"]
     for (var i = 0; i < fields.length; i++) {
       var field = fields[i]
-      if (Object.prototype.hasOwnProperty.call(params, field)) merged[field] = data[field]
+      // A later queued save may already have changed this field locally.
+      // Only the newest request for a field may update it.
+      if (Object.prototype.hasOwnProperty.call(params, field)
+          && preferenceFieldRevisions[field] === responseRevisions[field]) merged[field] = data[field]
     }
     if (Object.prototype.hasOwnProperty.call(params, "openaiApiKey") || params.clearOpenaiApiKey === true)
-      merged.openaiApiKeyConfigured = data.openaiApiKeyConfigured === true
+      if (preferenceFieldRevisions.openaiApiKey === responseRevisions.openaiApiKey)
+        merged.openaiApiKeyConfigured = data.openaiApiKeyConfigured === true
     applyPreferences(merged)
   }
   function saveLanguages() { savePreferences({translator: translator, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage}) }
@@ -367,8 +406,92 @@ Item {
   }
   function setSelectedContext(value) {
     if (value !== "" && !contextForId(value)) return
+    if (commitDisplayedLanguages()) saveLanguages()
     selectedContextId = value
     savePreferences({selectedContextId: value})
+  }
+  function cycleContext() {
+    if (!usesLlm() || busy) return
+    var options = contextOptions()
+    if (options.length === 0) return
+    var nextIndex = (contextIndex(selectedContextId) + 1) % options.length
+    setSelectedContext(options[nextIndex].id)
+  }
+  function openProfiles() {
+    setupOpen = false
+    profilesOpen = true
+    creatingProfile = false
+    profileSelectedIndex = 0
+    profileDeleteConfirmationId = ""
+    profilesError = ""
+    Qt.callLater(function() { newProfileButton.forceActiveFocus() })
+  }
+  function closeProfiles() {
+    profilesOpen = false
+    creatingProfile = false
+    profileSelectedIndex = 0
+    profileDeleteConfirmationId = ""
+    profilesError = ""
+    Qt.callLater(function() { sourceBox.forceActiveFocus() })
+  }
+  function startNewProfile() {
+    if (profiles.length >= 20) { profilesError = "Keep at most 20 profiles."; return }
+    creatingProfile = true
+    profileDeleteConfirmationId = ""
+    profilesError = ""
+    profileNameField.text = ""
+    Qt.callLater(function() { profileNameField.forceActiveFocus() })
+  }
+  function saveProfile() {
+    var name = profileNameField.text.trim()
+    if (name === "") { profilesError = "Give the profile a short name."; return }
+    var next = profiles.concat([{id: newProfileId(), name: name, translator: translator,
+      sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, selectedContextId: selectedContextId}])
+    savePreferences({profiles: next}, function(reply) {
+      if (reply && reply.ok) { creatingProfile = false; profilesError = "" }
+      else profilesError = reply && reply.error ? reply.error.message : "Could not save profile."
+    })
+  }
+  function loadProfile(id) {
+    var profile = profileForId(id)
+    if (!profile) return
+    var contextId = contextForId(profile.selectedContextId) ? profile.selectedContextId : ""
+    savePreferences({translator: profile.translator, sourceLanguage: profile.sourceLanguage,
+      targetLanguage: profile.targetLanguage, selectedContextId: contextId}, function(reply) {
+      if (reply && reply.ok) closeProfiles()
+      else profilesError = reply && reply.error ? reply.error.message : "Could not load profile."
+    })
+  }
+  function removeProfile(id) {
+    if (profileDeleteConfirmationId !== id) { profileDeleteConfirmationId = id; return }
+    var next = profiles.filter(function(profile) { return profile.id !== id })
+    savePreferences({profiles: next}, function(reply) {
+      if (reply && reply.ok) {
+        profileDeleteConfirmationId = ""
+        profileSelectedIndex = Math.min(profileSelectedIndex, 1 + next.length * 2)
+        profilesError = ""
+      }
+      else profilesError = reply && reply.error ? reply.error.message : "Could not remove profile."
+    })
+  }
+  function moveProfileSelection(direction) {
+    if (!profilesOpen || creatingProfile) return
+    var count = 2 + profiles.length * 2
+    profileSelectedIndex = (profileSelectedIndex + direction + count) % count
+    Qt.callLater(function() {
+      if (profileSelectedIndex === 0) newProfileButton.forceActiveFocus()
+      else if (profileSelectedIndex === 1) backProfileButton.forceActiveFocus()
+      else {
+        var profileIndex = Math.floor((profileSelectedIndex - 2) / 2)
+        var item = profileRepeater.itemAt(profileIndex)
+        if (!item) return
+        if ((profileSelectedIndex - 2) % 2 === 0 && item.loadButton) item.loadButton.forceActiveFocus()
+        else if (item.deleteButton) item.deleteButton.forceActiveFocus()
+      }
+    })
+  }
+  function selectedProfile() {
+    return profileSelectedIndex >= 2 ? profiles[Math.floor((profileSelectedIndex - 2) / 2)] : null
   }
   function startNewContext() {
     editingContextId = ""
@@ -472,6 +595,7 @@ Item {
     })
   }
   function openSetup() {
+    profilesOpen = false
     setupOpen = true
     settingsSelectedIndex = 0
     recordingAction = ""
@@ -485,6 +609,25 @@ Item {
     settingsError = ""
     resetConfirmationVisible = false
     sourceBox.forceActiveFocus()
+  }
+  function moveMainSelection(direction) {
+    if (mainControls.length === 0) return
+    var initialIndex = mainSelectedIndex
+    do {
+      mainSelectedIndex = (mainSelectedIndex + direction + mainControls.length) % mainControls.length
+      var control = mainControls[mainSelectedIndex]
+      var unavailable = typeof control.available !== "undefined" && !control.available
+    } while ((!control.visible || unavailable) && mainSelectedIndex !== initialIndex)
+    focusMainSelection()
+  }
+  function focusMainSelection() {
+    Qt.callLater(function() {
+      if (!opened || setupOpen || profilesOpen) return
+      var control = mainControls[mainSelectedIndex]
+      if (!control) return
+      if (typeof control.focusControl === "function") control.focusControl()
+      else control.forceActiveFocus()
+    })
   }
   function moveSettingsSelection(direction) {
     if (settingsControls.length === 0) return
@@ -502,7 +645,7 @@ Item {
     })
   }
   function canPerform(action) {
-    if (setupOpen) return false
+    if (setupOpen || profilesOpen) return false
     if (action === "switch") return !busy
     if (action === "translate") return canTranslate
     if (action === "undo") return clearUndoAvailable && !busy
@@ -593,21 +736,30 @@ Item {
   }
   function open(payload) {
     setupOpen = false
+    profilesOpen = false
+    creatingProfile = false
+    profileDeleteConfirmationId = ""
+    profilesError = ""
+    mainSelectedIndex = 3
     recordingAction = ""
     settingsError = ""
     resetConfirmationVisible = false
     opened = true
-    Qt.callLater(function(){ sourceBox.forceActiveFocus() })
+    focusMainSelection()
   }
   function close() { opened = false }
   function dismiss() { opened = false; if (shell) shell.hide((manifest && manifest.id) || "shaun.quick-translate") }
   function toggle() { opened ? dismiss() : open("{}") }
 
   Component.onCompleted: {
+    mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextPicker, clearButton, copyButton, copyAllButton, translateButton]
     settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton, barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton]
     run("engines.get", {}, function(reply) {
       if (reply && reply.ok) engines = reply.data || []
-      run("preferences.get", {}, function(preferences) { if (preferences && preferences.ok) applyPreferences(preferences.data) })
+      var initialGeneration = preferenceGeneration
+      run("preferences.get", {}, function(preferences) {
+        if (preferences && preferences.ok && initialGeneration === preferenceGeneration) applyPreferences(preferences.data)
+      })
     })
   }
 
@@ -711,8 +863,20 @@ Item {
     Shortcut {
       sequence: "Ctrl+?"
       context: Qt.WindowShortcut
-      enabled: root.opened && root.recordingAction === ""
+      enabled: root.opened && !root.profilesOpen && root.recordingAction === ""
       onActivated: root.setupOpen ? root.closeSetup() : root.openSetup()
+    }
+    Shortcut {
+      sequence: "Ctrl+Shift+P"
+      context: Qt.WindowShortcut
+      enabled: root.opened && root.recordingAction === ""
+      onActivated: root.profilesOpen ? root.closeProfiles() : root.openProfiles()
+    }
+    Shortcut {
+      sequence: "Ctrl+Shift+X"
+      context: Qt.WindowShortcut
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.usesLlm() && !root.busy
+      onActivated: root.cycleContext()
     }
     Shortcut {
       sequence: "Ctrl+J"
@@ -725,6 +889,30 @@ Item {
       context: Qt.WindowShortcut
       enabled: root.setupOpen && root.recordingAction === ""
       onActivated: root.moveSettingsSelection(-1)
+    }
+    Shortcut {
+      sequence: "Ctrl+J"
+      context: Qt.WindowShortcut
+      enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""
+      onActivated: root.moveProfileSelection(1)
+    }
+    Shortcut {
+      sequence: "Ctrl+K"
+      context: Qt.WindowShortcut
+      enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""
+      onActivated: root.moveProfileSelection(-1)
+    }
+    Shortcut {
+      sequence: "Ctrl+J"
+      context: Qt.WindowShortcut
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
+      onActivated: root.moveMainSelection(1)
+    }
+    Shortcut {
+      sequence: "Ctrl+K"
+      context: Qt.WindowShortcut
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
+      onActivated: root.moveMainSelection(-1)
     }
     Rectangle { anchors.fill: parent; color: Color.menu.scrim }
     MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
@@ -740,7 +928,16 @@ Item {
       MouseArea { anchors.fill: parent; onClicked: {} }
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) {
-        if (event.key === Qt.Key_Escape && root.recordingAction === "") { root.dismiss(); event.accepted = true }
+        if (event.key === Qt.Key_Escape && root.recordingAction === "") {
+          if (root.profilesOpen) root.closeProfiles()
+          else if (root.setupOpen) root.closeSetup()
+          else root.dismiss()
+          event.accepted = true
+        }
+        else if (root.profilesOpen && !root.creatingProfile && event.key === Qt.Key_Delete && root.selectedProfile()) {
+          root.removeProfile(root.selectedProfile().id)
+          event.accepted = true
+        }
         else if (root.handleActionShortcut(event)) event.accepted = true
       }
       Flickable {
@@ -761,8 +958,14 @@ Item {
         RowLayout {
           Layout.fillWidth: true
           Label { text: "󰗊"; color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading * 1.35; font.bold: true }
-          Label { text: root.setupOpen ? "Quick Translate Setup" : "Quick Translate"; color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
+          Label { text: root.profilesOpen ? "Translation Profiles" : (root.setupOpen ? "Quick Translate Setup" : "Quick Translate"); color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
           Button {
+            visible: !root.setupOpen && !root.profilesOpen
+            text: root.showHotkeys ? "󰀻  Ctrl+Shift+P" : "󰀻"
+            onClicked: root.openProfiles()
+          }
+          Button {
+            visible: !root.profilesOpen
             text: root.setupOpen ? (root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍") : (!root.showHotkeys ? "󰒓" : "󰒓  Ctrl+?")
             onClicked: root.setupOpen ? root.closeSetup() : root.openSetup()
           }
@@ -772,7 +975,7 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           ComboBox {
             id: fromPicker
@@ -790,8 +993,11 @@ Item {
               var exact = root.exactLanguageIndex(root.sourceLanguages(), editText)
               root.selectSourceLanguage(exact >= 0 ? exact : currentIndex)
             }
+            onActiveFocusChanged: {
+              if (!activeFocus && !root.syncingLanguageSelectors && root.commitDisplayedLanguages()) root.saveLanguages()
+            }
           }
-          HotkeyButton { actionText: "⇄"; hotkeyText: root.shortcut("switch"); available: !root.busy; onClicked: root.swap() }
+          HotkeyButton { id: switchButton; actionText: "⇄"; hotkeyText: root.shortcut("switch"); available: !root.busy; onClicked: root.swap() }
           ComboBox {
             id: toPicker
             Layout.fillWidth: true
@@ -808,11 +1014,14 @@ Item {
               var exact = root.exactLanguageIndex(root.targetLanguages(), editText)
               root.selectTargetLanguage(exact >= 0 ? exact : currentIndex)
             }
+            onActiveFocusChanged: {
+              if (!activeFocus && !root.syncingLanguageSelectors && root.commitDisplayedLanguages()) root.saveLanguages()
+            }
           }
         }
         Item { Layout.preferredHeight: Style.spacing.md }
         ScrollView {
-          visible: !root.setupOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           TextArea {
@@ -843,11 +1052,12 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
-          Label { visible: root.translating; text: "Translating…"; color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
           Item { Layout.fillWidth: true }
+          Label { visible: root.showHotkeys; text: "Ctrl+J/K select"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           Label { text: root.activeTranslatorLabel(); color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
+          Label { visible: root.usesLlm() && root.showHotkeys; text: "Ctrl+Shift+X"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           ComboBox {
             id: contextPicker
             visible: root.usesLlm()
@@ -882,21 +1092,178 @@ Item {
           Label { text: sourceBox.text.length + " / " + root.maxChars.toLocaleString(); color: sourceBox.text.length > root.maxChars ? "#e06c75" : Color.menu.text; opacity: .75 }
         }
         ScrollView {
-          visible: !root.setupOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           opacity: .55
-          TextArea { id: outputBox; text: root.translatedText; readOnly: true; placeholderText: root.showHotkeys ? root.shortcut("translate") + " to translate" : "Translation"; wrapMode: TextEdit.Wrap; selectByMouse: true; color: Color.menu.text; font.family: Style.font.menuFamily }
+          TextArea { id: outputBox; text: root.translating ? "Translating…" : root.translatedText; readOnly: true; placeholderText: root.showHotkeys ? root.shortcut("translate") + " to translate" : "Translation"; wrapMode: TextEdit.Wrap; selectByMouse: true; color: Color.menu.text; font.family: Style.font.menuFamily }
         }
-        Label { visible: !root.setupOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+        Label { visible: !root.setupOpen && !root.profilesOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
         RowLayout {
-          visible: !root.setupOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
-          HotkeyButton { actionText: "󰆴  Clear"; compactActionText: "󰆴"; hotkeyText: root.shortcut("clear"); reservedText: "󰆴  Clear  " + root.shortcut("clear"); available: !root.busy && (sourceBox.text.length > 0 || root.translatedText.length > 0); visuallyMuted: sourceBox.text.length === 0 && root.translatedText.length === 0; onClicked: root.clearAll() }
-          HotkeyButton { actionText: root.copiedAction === "translation" ? "󰆏  Copied ✓" : "󰆏  Copy translation"; compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"; hotkeyText: root.copiedAction === "translation" ? "" : root.shortcut("copy"); reservedText: "󰆏  Copy translation  " + root.shortcut("copy"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(root.translatedText, "translation") }
-          HotkeyButton { actionText: root.copiedAction === "both" ? "󰆏 󰆏  Copied ✓" : "󰆏 󰆏  Copy both"; compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"; hotkeyText: root.copiedAction === "both" ? "" : root.shortcut("copyAll"); reservedText: "󰆏 󰆏  Copy both  " + root.shortcut("copyAll"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(sourceBox.text + "\n\n" + root.translatedText, "both") }
+          HotkeyButton { id: clearButton; actionText: "󰆴  Clear"; compactActionText: "󰆴"; hotkeyText: root.shortcut("clear"); reservedText: "󰆴  Clear  " + root.shortcut("clear"); available: !root.busy && (sourceBox.text.length > 0 || root.translatedText.length > 0); visuallyMuted: sourceBox.text.length === 0 && root.translatedText.length === 0; onClicked: root.clearAll() }
+          HotkeyButton { id: copyButton; actionText: root.copiedAction === "translation" ? "󰆏  Copied ✓" : "󰆏  Copy translation"; compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"; hotkeyText: root.copiedAction === "translation" ? "" : root.shortcut("copy"); reservedText: "󰆏  Copy translation  " + root.shortcut("copy"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(root.translatedText, "translation") }
+          HotkeyButton { id: copyAllButton; actionText: root.copiedAction === "both" ? "󰆏 󰆏  Copied ✓" : "󰆏 󰆏  Copy both"; compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"; hotkeyText: root.copiedAction === "both" ? "" : root.shortcut("copyAll"); reservedText: "󰆏 󰆏  Copy both  " + root.shortcut("copyAll"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(sourceBox.text + "\n\n" + root.translatedText, "both") }
           Item { Layout.fillWidth: true }
-          HotkeyButton { actionText: root.translating ? "󰗊  Translating…" : "󰗊  Translate"; compactActionText: root.translating ? "󰗊 …" : "󰗊"; hotkeyText: root.translating ? "" : root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.canTranslate; visuallyMuted: sourceBox.text.trim().length === 0 || sourceBox.text.length > root.maxChars; onClicked: root.translate() }
+          HotkeyButton { id: translateButton; actionText: root.translating ? "󰗊  Translating…" : "󰗊  Translate"; compactActionText: root.translating ? "󰗊 …" : "󰗊"; hotkeyText: root.translating ? "" : root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.canTranslate; visuallyMuted: sourceBox.text.trim().length === 0 || sourceBox.text.length > root.maxChars; onClicked: root.translate() }
+        }
+        ColumnLayout {
+          visible: root.profilesOpen
+          Layout.fillWidth: true
+          spacing: Style.spacing.md
+          Label {
+            Layout.fillWidth: true
+            text: "Save the current translator, languages, and translation context under a short name."
+            color: Color.menu.text
+            opacity: .80
+            wrapMode: Text.WordWrap
+            font.family: Style.font.menuFamily
+          }
+          RowLayout {
+            Layout.fillWidth: true
+            Label {
+              text: root.profileSelectedIndex === 0 ? "󰁔" : ""
+              color: Color.menu.text
+              font.family: Style.font.menuFamily
+              Layout.preferredWidth: Style.space(16)
+            }
+            Button {
+              id: newProfileButton
+              focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 0
+              focusable: true
+              text: "New from current settings"
+              bordered: true
+              enabled: !root.busy && root.profiles.length < 20
+              onClicked: root.startNewProfile()
+              onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 0
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                  root.startNewProfile()
+                  event.accepted = true
+                }
+              }
+            }
+            Item { Layout.fillWidth: true }
+            Label {
+              text: root.profileSelectedIndex === 1 ? "󰁔" : ""
+              color: Color.menu.text
+              font.family: Style.font.menuFamily
+              Layout.preferredWidth: Style.space(16)
+            }
+            Button {
+              id: backProfileButton
+              focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 1
+              focusable: true
+              text: "Back"
+              bordered: true
+              onClicked: root.closeProfiles()
+              onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 1
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                  root.closeProfiles()
+                  event.accepted = true
+                }
+              }
+            }
+          }
+          ColumnLayout {
+            visible: root.creatingProfile
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+            Label { text: "Profile name"; color: Color.menu.text; font.family: Style.font.menuFamily }
+            RowLayout {
+              Layout.fillWidth: true
+              TextField {
+                id: profileNameField
+                Layout.fillWidth: true
+                maximumLength: 64
+                placeholderText: "e.g. Formal Japanese"
+                onAccepted: root.saveProfile()
+              }
+              Button { text: "Save"; bordered: true; enabled: !root.busy; onClicked: root.saveProfile() }
+              Button { text: "Cancel"; bordered: true; onClicked: { root.creatingProfile = false; root.profilesError = "" } }
+            }
+          }
+          Label {
+            visible: root.profiles.length === 0 && !root.creatingProfile
+            text: "No profiles saved yet."
+            color: Color.menu.text
+            opacity: .75
+            font.family: Style.font.menuFamily
+          }
+          Label {
+            visible: root.showHotkeys
+            text: "Ctrl+J/K select · Enter load/create · Delete remove"
+            color: Color.menu.text
+            opacity: .65
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.caption
+          }
+          Repeater {
+            id: profileRepeater
+            model: root.profiles
+            delegate: RowLayout {
+              required property var modelData
+              required property int index
+              property var loadButton: profileLoadButton
+              property var deleteButton: profileDeleteButton
+              Layout.fillWidth: true
+              spacing: Style.spacing.sm
+              Label {
+                text: root.profileSelectedIndex === 2 + index * 2 || root.profileSelectedIndex === 3 + index * 2 ? "󰁔" : ""
+                color: Color.menu.text
+                font.family: Style.font.menuFamily
+                Layout.preferredWidth: Style.space(16)
+              }
+              Button {
+                id: profileLoadButton
+                focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 2 + index * 2
+                focusable: true
+                Layout.fillWidth: true
+                text: modelData.name + "  ·  " + modelData.translator + "  ·  "
+                  + root.nameFor(modelData.sourceLanguage) + " → " + root.nameFor(modelData.targetLanguage)
+                  + "  ·  " + root.profileContextLabel(modelData.selectedContextId)
+                bordered: true
+                enabled: !root.busy
+                onClicked: root.loadProfile(modelData.id)
+                onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 2 + index * 2
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                    root.loadProfile(modelData.id)
+                    event.accepted = true
+                  }
+                }
+              }
+              Button {
+                id: profileDeleteButton
+                focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 3 + index * 2
+                focusable: true
+                text: root.profileDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"
+                bordered: true
+                enabled: !root.busy
+                onClicked: root.removeProfile(modelData.id)
+                onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 3 + index * 2
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                    root.removeProfile(modelData.id)
+                    event.accepted = true
+                  }
+                }
+              }
+            }
+          }
+          Label {
+            visible: root.profilesError !== ""
+            Layout.fillWidth: true
+            text: root.profilesError
+            color: "#e06c75"
+            wrapMode: Text.WordWrap
+          }
         }
         ColumnLayout {
           visible: root.setupOpen

@@ -16,6 +16,8 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_CONTEXTS = 20
 MAX_CONTEXT_NAME_LENGTH = 64
 MAX_CONTEXT_INSTRUCTION_LENGTH = 2000
+MAX_PROFILES = 20
+MAX_PROFILE_NAME_LENGTH = 64
 WEB_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
 EDITING_KEYS = {"Space", "Enter", "Tab", "Esc", "Backspace", "Delete"}
 DEFAULT_SHORTCUTS = {
@@ -37,6 +39,7 @@ DEFAULTS = {
     "openaiReasoningEffort": "minimal",
     "translationContexts": [],
     "selectedContextId": "",
+    "profiles": [],
 }
 OPENAI_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 with Path(__file__).with_name("languages.json").open(encoding="utf-8") as language_file:
@@ -94,6 +97,7 @@ def default_preferences():
         "openaiReasoningEffort": DEFAULTS["openaiReasoningEffort"],
         "translationContexts": [],
         "selectedContextId": "",
+        "profiles": [],
     }
 
 def reply(data=None, error=None):
@@ -141,6 +145,41 @@ def translation_context_error(raw):
         return "Each context needs a unique name and instruction."
     return None
 
+def valid_profile_context_id(value):
+    return value == "" or (isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value))
+
+def normalize_profiles(raw):
+    if not isinstance(raw, list): return []
+    profiles, ids, names = [], set(), set()
+    for profile in raw[:MAX_PROFILES]:
+        if not isinstance(profile, dict): continue
+        profile_id, name = profile.get("id"), profile.get("name")
+        translator = profile.get("translator")
+        source, target = profile.get("sourceLanguage"), profile.get("targetLanguage")
+        context_id = profile.get("selectedContextId", "")
+        if (not isinstance(profile_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", profile_id)
+                or profile_id in ids or not isinstance(name, str) or translator not in ENGINE_METADATA
+                or source not in LANGUAGE_CODES or target not in LANGUAGE_CODES
+                or not valid_profile_context_id(context_id)
+                or not pair_supported(translator, source, target)):
+            continue
+        name = name.strip()
+        normalized_name = name.casefold()
+        if not name or len(name) > MAX_PROFILE_NAME_LENGTH or normalized_name in names:
+            continue
+        profiles.append({"id": profile_id, "name": name, "translator": translator,
+                         "sourceLanguage": source, "targetLanguage": target,
+                         "selectedContextId": context_id})
+        ids.add(profile_id); names.add(normalized_name)
+    return profiles
+
+def profile_error(raw):
+    if not isinstance(raw, list) or len(raw) > MAX_PROFILES:
+        return "Keep at most %d profiles." % MAX_PROFILES
+    if len(normalize_profiles(raw)) != len(raw):
+        return "Each profile needs a unique name and valid translation settings."
+    return None
+
 def preferences_get():
     # read_preferences() already swallows file-read/parse errors and returns
     # {}, so any corrupt or missing state file falls back to safe defaults
@@ -159,6 +198,7 @@ def preferences_get():
     available_context_ids = {context["id"] for context in result["translationContexts"]}
     if raw.get("selectedContextId") in available_context_ids:
         result["selectedContextId"] = raw["selectedContextId"]
+    result["profiles"] = normalize_profiles(raw.get("profiles"))
     result["openaiApiKeyConfigured"] = isinstance(raw.get("openaiApiKey"), str) and bool(raw["openaiApiKey"])
     return reply(result)
 
@@ -167,6 +207,8 @@ def shortcut_error(value):
         return "Choose a valid shortcut for every action."
     if value == "Ctrl+Shift+U": return "Ctrl+Shift+U is reserved for Unicode input. Choose another shortcut."
     if value in {"Ctrl+?", "Ctrl+Shift+?", "Ctrl+Shift+/"}: return "Ctrl+? opens Setup. Choose another shortcut."
+    if value == "Ctrl+Shift+P": return "Ctrl+Shift+P opens Profiles. Choose another shortcut."
+    if value == "Ctrl+Shift+X": return "Ctrl+Shift+X changes the translation context. Choose another shortcut."
     if value in {"Ctrl+J", "Ctrl+K"}: return "Ctrl+J and Ctrl+K navigate Setup. Choose another shortcut."
     parts = value.split("+")
     modifiers, key = parts[:-1], parts[-1]
@@ -218,6 +260,7 @@ def preferences_set(params):
         "openaiReasoningEffort": params.get("openaiReasoningEffort", current["openaiReasoningEffort"]),
         "translationContexts": params.get("translationContexts", current["translationContexts"]),
         "selectedContextId": params.get("selectedContextId", current["selectedContextId"]),
+        "profiles": params.get("profiles", current["profiles"]),
         "openaiApiKey": openai_api_key,
     }
     if "shortcuts" in params and not isinstance(params["shortcuts"], dict):
@@ -239,6 +282,9 @@ def preferences_set(params):
     context_error = translation_context_error(value["translationContexts"])
     if context_error:
         return fail("invalid_context", context_error)
+    profiles_error = profile_error(value["profiles"])
+    if profiles_error:
+        return fail("invalid_profile", profiles_error)
     if not isinstance(value["selectedContextId"], str):
         return fail("invalid_context", "Choose a valid translation context.")
     context_ids = {context["id"] for context in value["translationContexts"]}

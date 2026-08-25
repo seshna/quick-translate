@@ -52,6 +52,22 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(qt.preferences_set({"translationContexts": [{"id": "bad id", "name": "x", "instruction": "y"}]})["error"]["code"], "invalid_context")
     duplicate = contexts + [{"id": "casual-ja", "name": "formal japanese", "instruction": "Use casual Japanese."}]
     self.assertEqual(qt.preferences_set({"translationContexts": duplicate})["error"]["code"], "invalid_context")
+  def test_profile_preferences_and_deleted_context_references(self):
+    profile = {"id": "formal-ja", "name": "Formal Japanese", "translator": "openai",
+               "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "formal-context"}
+    result = qt.preferences_set({"profiles": [profile]})
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["data"]["profiles"], [profile])
+    self.assertEqual(qt.preferences_get()["data"]["profiles"], [profile])
+    path = Path(qt.state_path())
+    path.write_text(json.dumps({"profiles": [profile, {"id": "bad profile", "name": "Broken"}]}))
+    self.assertEqual(qt.preferences_get()["data"]["profiles"], [profile])
+    duplicate = [profile, {**profile, "id": "casual-ja", "name": "formal japanese"}]
+    self.assertEqual(qt.preferences_set({"profiles": duplicate})["error"]["code"], "invalid_profile")
+    invalid_pair = [{**profile, "translator": "apertium", "sourceLanguage": "en", "targetLanguage": "ja"}]
+    self.assertEqual(qt.preferences_set({"profiles": invalid_pair})["error"]["code"], "invalid_profile")
+    too_many = [{**profile, "id": "profile-%d" % index, "name": "Profile %d" % index} for index in range(qt.MAX_PROFILES + 1)]
+    self.assertEqual(qt.preferences_set({"profiles": too_many})["error"]["code"], "invalid_profile")
   def test_rejects_duplicate_shortcuts_and_allows_reassigning_undo(self):
     self.assertTrue(qt.preferences_set({"shortcuts": {"undo": "Alt+Z"}})["ok"])
     self.assertTrue(qt.preferences_set({"shortcuts": {"copy": "Ctrl+Z"}})["ok"])
@@ -61,7 +77,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(result["error"]["code"], "reserved_shortcut")
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"]["switch"], "Ctrl+U")
   def test_rejects_reserved_navigation_editing_and_super_shortcuts(self):
-    for shortcut in ("Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+J", "A", "Enter", "Meta+U"):
+    for shortcut in ("Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+Shift+P", "Ctrl+Shift+X", "Ctrl+J", "A", "Enter", "Meta+U"):
       with self.subTest(shortcut=shortcut):
         self.assertEqual(qt.preferences_set({"shortcuts": {"switch": shortcut}})["error"]["code"], "reserved_shortcut")
   def test_rejects_malformed_shortcuts_and_allows_function_keys(self):
@@ -211,7 +227,8 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('Flickable {', qml)
     self.assertIn('contentHeight: content.implicitHeight', qml)
     self.assertGreaterEqual(qml.count('ScrollView {'), 2)
-    self.assertIn('text: "Translating…"', qml)
+    self.assertIn('text: root.translating ? "Translating…" : root.translatedText', qml)
+    self.assertNotIn('Label { visible: root.translating; text: "Translating…"', qml)
     self.assertIn('opacity: .55', qml)
     self.assertIn("stdinEnabled: true", qml)
     self.assertIn('write(payload + "\\n")', qml)
@@ -238,6 +255,10 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('OpenAI · GPT-5 mini', qml)
     self.assertIn('unofficial, may change or rate-limit requests', qml)
     self.assertIn('sequence: "Ctrl+?"', qml)
+    self.assertIn('sequence: "Ctrl+Shift+P"', qml)
+    self.assertIn('sequence: "Ctrl+Shift+X"', qml)
+    self.assertIn('function cycleContext()', qml)
+    self.assertIn('onActivated: root.cycleContext()', qml)
     self.assertIn('"󰒓  Ctrl+?"', qml)
     self.assertIn('"󰁍  Ctrl+?"', qml)
     self.assertIn('root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍"', qml)
@@ -247,6 +268,12 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertNotIn('Enter or Space change', qml)
     self.assertIn('settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton', qml)
+    self.assertIn('mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextPicker, clearButton, copyButton, copyAllButton, translateButton]', qml)
+    self.assertIn('function moveMainSelection(direction)', qml)
+    self.assertIn('function focusMainSelection()', qml)
+    self.assertIn('onActivated: root.moveMainSelection(1)', qml)
+    self.assertIn('onActivated: root.moveMainSelection(-1)', qml)
+    self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertIn('settingsControls.length', qml)
     self.assertIn('control.forceActiveFocus()', qml)
     self.assertIn('"Restore all default shortcuts"', qml)
@@ -282,6 +309,25 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"', qml)
     self.assertIn('compactActionText: root.translating ? "󰗊 …" : "󰗊"', qml)
     self.assertIn('!control.showHotkey ? (control.compactActionText !== "" ? control.compactActionText : control.actionText)', qml)
+  def test_qml_profiles_create_load_and_delete(self):
+    qml = (HERE / "QuickTranslate.qml").read_text()
+    for function in ("function openProfiles()", "function startNewProfile()", "function saveProfile()", "function loadProfile(id)", "function removeProfile(id)"):
+      self.assertIn(function, qml)
+    self.assertIn('profiles: profiles', qml)
+    self.assertIn('savePreferences({profiles: next}', qml)
+    self.assertIn('text: root.profileDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"', qml)
+    self.assertIn('text: root.showHotkeys ? "󰀻  Ctrl+Shift+P" : "󰀻"', qml)
+    self.assertIn("function moveProfileSelection(direction)", qml)
+    self.assertIn("profileRepeater.itemAt(profileIndex)", qml)
+    self.assertIn("id: newProfileButton\n              focus:", qml)
+    self.assertIn('text: root.profileSelectedIndex === 0 ? "󰁔" : ""', qml)
+    self.assertIn("id: backProfileButton", qml)
+    self.assertIn("id: profileLoadButton", qml)
+    self.assertIn("id: profileDeleteButton", qml)
+    self.assertIn("focusable: true", qml)
+    self.assertIn('enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""', qml)
+    self.assertIn('text: "Ctrl+J/K select · Enter load/create · Delete remove"', qml)
+    self.assertIn("event.key === Qt.Key_Delete && root.selectedProfile()", qml)
   def test_qml_reopens_on_the_main_translation_page(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     open_function = qml.split("function open(payload)", 1)[1].split("function close()", 1)[0]
@@ -292,8 +338,12 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn("pendingOperations = pendingOperations.concat", qml)
     self.assertIn("function startNextOperation()", qml)
     self.assertIn("root.startNextOperation()", qml)
-    self.assertIn("function applyPreferenceResult(params, data)", qml)
-    self.assertIn("applyPreferenceResult(params, reply.data)", qml)
+    self.assertIn("function applyPreferenceResult(params, data, responseRevisions)", qml)
+    self.assertIn("property int preferenceGeneration: 0", qml)
+    self.assertIn("property var preferenceFieldRevisions: ({})", qml)
+    self.assertIn("preferenceFieldRevisions[field] === responseRevisions[field]", qml)
+    self.assertIn("initialGeneration === preferenceGeneration", qml)
+    self.assertIn("applyPreferenceResult(params, reply.data, responseRevisions)", qml)
     self.assertIn('code: "helper_failed"', qml)
     self.assertIn("if (callback)", qml)
     self.assertNotIn("else if (callback)", qml)
@@ -310,6 +360,12 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn("function commitDisplayedLanguages()", qml)
     translate_function = qml.split("function translate()", 1)[1].split("function swap()", 1)[0]
     self.assertIn("if (commitDisplayedLanguages()) saveLanguages()", translate_function)
+    self.assertIn("function setSelectedContext(value)", qml)
+    self.assertGreaterEqual(qml.count("if (commitDisplayedLanguages()) saveLanguages()"), 2)
+    source_picker = qml.split("id: fromPicker", 1)[1].split("id: toPicker", 1)[0]
+    target_picker = qml.split("id: toPicker", 1)[1].split("Item { Layout.preferredHeight", 1)[0]
+    self.assertIn("onActiveFocusChanged:", source_picker)
+    self.assertIn("onActiveFocusChanged:", target_picker)
     self.assertIn("onActivated: root.selectSourceLanguage(currentIndex)", qml)
     self.assertIn("onActivated: root.selectTargetLanguage(currentIndex)", qml)
   def test_bar_widget_uses_matching_icon(self):

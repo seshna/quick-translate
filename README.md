@@ -40,13 +40,14 @@ Disable and remove the plugin with:
 
 - Google (default), Apertium, Bing, Reverso, Ollama Local, and OpenAI translators
 - Searchable, engine-aware From and To language selectors
+- Named profiles for a translator, language pair, and translation context
 - Multiline input and read-only translated output
 - English → Japanese by default; selected languages save immediately
 - Copy translation, or copy source and translation together
 - Clear both text boxes and undo the clear
 - A matching Omarchy bar launcher that can be hidden from Setup
 - Reconfigurable action shortcuts, recorded directly from the keyboard
-- Optional shortcut hints on the main page, and `Ctrl+?` to open Setup
+- Optional shortcut hints on the main page, `Ctrl+?` to open Setup, `Ctrl+Shift+P` for profiles, and `Ctrl+Shift+X` to cycle contexts
 - Up to 5,000 input characters.
 
 ## Shortcuts
@@ -60,6 +61,8 @@ Disable and remove the plugin with:
 | Ctrl+Shift+K | Clear both text boxes (configurable) |
 | Ctrl+Z | Undo the most recent Clear (configurable) |
 | Ctrl+? | Open Setup |
+| Ctrl+Shift+P | Open translation profiles |
+| Ctrl+Shift+X | Cycle translation contexts (Ollama/OpenAI) |
 | Escape | Close the overlay |
 
 
@@ -72,9 +75,9 @@ to your local Ollama service; install the `gemma3` model with `ollama pull gemma
 OpenAI sends requests to OpenAI and requires an API key entered in Setup. Entered
 text is sent to the selected provider, so do not use this plugin for sensitive content.
 
-The selected translator and language pair, shortcut and display preferences,
-translation contexts, OpenAI reasoning effort, and optional OpenAI API key are
-persisted under the XDG state directory, normally:
+The selected translator and language pair, saved profiles, shortcut and display
+preferences, translation contexts, OpenAI reasoning effort, and optional OpenAI
+API key are persisted under the XDG state directory, normally:
 
     ~/.local/state/omarchy/quick-translate/preferences.json
 
