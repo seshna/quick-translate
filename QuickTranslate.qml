@@ -14,6 +14,19 @@ Item {
   property bool opened: false
   property bool busy: false
   property bool translating: false
+  property string translationPreview: ""
+  property string translationStage: "translating"
+  property bool translationReviewEnabled: false
+  property int translationGeneratedCharacters: 0
+  property var reviewRetryRequest: null
+  readonly property bool canRetryReview: !busy && reviewRetryRequest !== null && translationRequestIsCurrent(reviewRetryRequest)
+  property double translationStartedAt: 0
+  property int translationElapsedSeconds: 0
+  readonly property string translationStatus: (translationStage === "reviewing" ? "Reviewing translation… " : "Translating… ")
+    + Math.floor(translationElapsedSeconds / 60) + ":" + (translationElapsedSeconds % 60).toString().padStart(2, "0")
+    + (translationGeneratedCharacters > 0 ? " · " + translationGeneratedCharacters.toLocaleString()
+      + (translationStage === "reviewing" ? " review characters generated" : " characters generated")
+      : " · Waiting for the first text…")
   property var pendingOperations: []
   property string copiedAction: ""
   property string sourceLanguage: "en"
@@ -25,22 +38,26 @@ Item {
   readonly property var shortcutActions: ["copy", "copyAll", "switch", "clear", "translate", "undo"]
   property bool showBarIcon: true
   property bool showHotkeys: true
+  property bool reviewTranslation: false
   property bool openaiApiKeyConfigured: false
   property string openaiReasoningEffort: "minimal"
-  property var translationContexts: []
-  property string selectedContextId: ""
+  property string activeProfileId: ""
   property var profiles: []
   property bool profilesOpen: false
   property bool creatingProfile: false
+  property string editingProfileId: ""
+  property string profileDraftTranslator: ""
+  property string profileDraftSource: ""
+  property string profileDraftTarget: ""
+  readonly property bool editingProfile: editingProfileId !== ""
+  readonly property bool profileFormOpen: creatingProfile || editingProfile
   property int profileSelectedIndex: 0
   property string profileDeleteConfirmationId: ""
   property string profilesError: ""
-  property bool contextsOpen: false
-  property bool contextEditorOpen: false
-  property int contextSelectedIndex: 0
-  property string contextDeleteConfirmationId: ""
-  property string contextsError: ""
-  property string editingContextId: ""
+  readonly property var displayProfiles: groupedProfiles()
+  readonly property var shownProfile: profileSelectedIndex < displayProfiles.length ? displayProfiles[profileSelectedIndex] : null
+  readonly property int maxProfileInstructionChars: 11000
+  readonly property int profileInstructionLength: Array.from(profileInstructionField.text).length
   property bool setupOpen: false
   property int settingsSelectedIndex: 0
   property string recordingAction: ""
@@ -103,6 +120,45 @@ Item {
       focusable: true
       enabled: control.available
       onClicked: control.clicked()
+    }
+  }
+
+  component ProfileDetailRow: RowLayout {
+    property string label: ""
+    property string value: ""
+    property string note: ""
+    property int maxLines: 1000
+    Layout.fillWidth: true
+    spacing: Style.spacing.md
+    Label {
+      text: parent.label
+      color: Color.menu.text
+      opacity: .68
+      font.family: Style.font.menuFamily
+      font.pixelSize: Style.font.caption
+      Layout.preferredWidth: Style.space(96)
+      Layout.alignment: Qt.AlignTop
+    }
+    Label {
+      text: parent.value
+      color: Color.menu.text
+      wrapMode: Text.Wrap
+      maximumLineCount: parent.maxLines
+      elide: Text.ElideRight
+      font.family: Style.font.menuFamily
+      Layout.fillWidth: true
+    }
+    Label {
+      visible: parent.note !== ""
+      text: parent.note
+      color: Color.menu.text
+      opacity: parent.note === "changes" ? 1 : .68
+      font.family: Style.font.menuFamily
+      font.pixelSize: Style.font.caption
+      font.bold: parent.note === "changes"
+      horizontalAlignment: Text.AlignRight
+      Layout.preferredWidth: Style.space(72)
+      Layout.alignment: Qt.AlignTop
     }
   }
 
@@ -199,32 +255,40 @@ Item {
     return engine ? engine.name : "Google"
   }
   function usesLlm() { return translator === "ollama" || translator === "openai" }
-  function contextOptions() {
-    var options = [{id: "", label: "No context"}]
-    for (var i = 0; i < translationContexts.length; i++)
-      options.push({id: translationContexts[i].id, label: translationContexts[i].name})
-    return options
-  }
-  function contextIndex(id) {
-    var options = contextOptions()
-    for (var i = 0; i < options.length; i++) if (options[i].id === id) return i
-    return 0
-  }
-  function contextForId(id) {
-    for (var i = 0; i < translationContexts.length; i++)
-      if (translationContexts[i].id === id) return translationContexts[i]
-    return null
-  }
-  function newContextId() { return "context-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
   function newProfileId() { return "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
   function profileForId(id) {
     for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return profiles[i]
     return null
   }
-  function profileContextLabel(id) {
-    var context = contextForId(id)
-    return context ? context.name : "No context"
+  function profilePairLabel(profile) { return nameFor(profile.sourceLanguage) + " → " + nameFor(profile.targetLanguage) }
+  // Language pairs sort alphabetically; profiles keep their saved order within a pair.
+  function groupedProfiles() {
+    var entries = profiles.map(function(profile, index) { return {profile: profile, index: index, pair: profilePairLabel(profile)} })
+    entries.sort(function(a, b) { return a.pair.localeCompare(b.pair) || a.index - b.index })
+    return entries.map(function(entry) { return entry.profile })
   }
+  function profileDisplayIndex(id) {
+    for (var i = 0; i < displayProfiles.length; i++) if (displayProfiles[i].id === id) return i
+    return displayProfiles.length
+  }
+  function profileStartsGroup(index) {
+    return index === 0 || profilePairLabel(displayProfiles[index - 1]) !== profilePairLabel(displayProfiles[index])
+  }
+  function profilePairCount(profile) {
+    var pair = profilePairLabel(profile)
+    return profiles.filter(function(item) { return profilePairLabel(item) === pair }).length
+  }
+  function activeProfile() { return profileForId(activeProfileId) }
+  function activeProfileInstruction() {
+    var profile = activeProfile()
+    return profile ? profile.instruction : ""
+  }
+  function activeProfileLabel() {
+    var profile = activeProfile()
+    if (!profile) return "No profile"
+    return profile.name.length > 28 ? profile.name.slice(0, 27) + "…" : profile.name
+  }
+  function translatorUsesLlm(id) { return id === "ollama" || id === "openai" }
   function reasoningEffortLabel(value) { return value.charAt(0).toUpperCase() + value.slice(1) }
   function openaiReasoningEffortIndex() { return openaiReasoningEfforts.indexOf(openaiReasoningEffort) }
   function translatorOptions() {
@@ -253,28 +317,28 @@ Item {
     for (var i = 0; i < options.length; i++) if (options[i].id === translator) return i
     return 0
   }
-  function pairsForEngine() { var engine = engineFor(translator); return engine && engine.pairs ? engine.pairs : [] }
+  function pairsForEngine(engineId) { var engine = engineFor(engineId || translator); return engine && engine.pairs ? engine.pairs : [] }
   // An empty pairs list means either the engine has no pair restriction of
   // its own (e.g. Google, Bing) or engines/languages haven't loaded yet —
   // in both cases fall back to the full language catalogue rather than
   // showing no options.
-  function sourceCodes() {
-    var pairs = pairsForEngine()
+  function sourceCodes(engineId) {
+    var pairs = pairsForEngine(engineId)
     if (pairs.length === 0) return languages.map(function(item) { return item[0] })
     var result = []
     for (var i = 0; i < pairs.length; i++) if (result.indexOf(pairs[i][0]) < 0) result.push(pairs[i][0])
     return result
   }
-  function targetCodes(source) {
-    var pairs = pairsForEngine()
+  function targetCodes(source, engineId) {
+    var pairs = pairsForEngine(engineId)
     if (pairs.length === 0) return languages.map(function(item) { return item[0] })
     var result = []
     for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === source && result.indexOf(pairs[i][1]) < 0) result.push(pairs[i][1])
-    if (sourceCodes().indexOf(source) >= 0 && result.indexOf(source) < 0) result.push(source)
+    if (sourceCodes(engineId).indexOf(source) >= 0 && result.indexOf(source) < 0) result.push(source)
     return result
   }
-  function sourceLanguages() { var codes = sourceCodes(); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
-  function targetLanguages() { var codes = targetCodes(sourceLanguage); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
+  function sourceLanguages(engineId) { var codes = sourceCodes(engineId); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
+  function targetLanguages(source, engineId) { var codes = targetCodes(source === undefined ? sourceLanguage : source, engineId); return languages.filter(function(item) { return codes.indexOf(item[0]) >= 0 }) }
   function normalizeLanguagePair() {
     var sources = sourceCodes()
     if (sources.length === 0) return
@@ -297,7 +361,20 @@ Item {
   }
   function startOperation(operation, params, done) {
     busy = true
-    translating = operation === "translate"
+    translating = operation === "translate" || operation === "review"
+    if (translating) {
+      translationPreview = ""
+      translationStage = operation === "review" ? "reviewing" : "translating"
+      translationReviewEnabled = operation === "review" || (params.reviewTranslation === true
+        && (params.translator === "ollama" || params.translator === "openai") && params.sourceLanguage !== params.targetLanguage)
+      translationGeneratedCharacters = 0
+      if (translationReviewEnabled) translatedText = ""
+      translationStartedAt = Date.now()
+      translationElapsedSeconds = 0
+    }
+    bridge.responseText = ""
+    bridge.stoppedReason = ""
+    bridge.translationRequest = translating ? params : null
     bridge.payload = JSON.stringify({operation: operation, params: params || {}})
     bridge.done = done
     bridge.command = ["python3", helperPath]
@@ -326,7 +403,7 @@ Item {
         && translator === request.translator
         && sourceLanguage === request.sourceLanguage
         && targetLanguage === request.targetLanguage
-        && selectedContextId === request.selectedContextId
+        && activeProfileId === request.activeProfileId
         && openaiReasoningEffort === request.openaiReasoningEffort
         && fromPicker.editText === nameFor(sourceLanguage)
         && toPicker.editText === nameFor(targetLanguage)
@@ -338,11 +415,11 @@ Item {
     shortcuts = data.shortcuts || shortcuts
     showBarIcon = data.showBarIcon !== false
     showHotkeys = data.showHotkeys !== false
+    reviewTranslation = data.reviewTranslation === true
     openaiApiKeyConfigured = data.openaiApiKeyConfigured === true
     openaiReasoningEffort = openaiReasoningEfforts.indexOf(data.openaiReasoningEffort) >= 0 ? data.openaiReasoningEffort : "minimal"
-    translationContexts = Array.isArray(data.translationContexts) ? data.translationContexts : []
-    selectedContextId = contextForId(data.selectedContextId) ? data.selectedContextId : ""
     profiles = Array.isArray(data.profiles) ? data.profiles : []
+    activeProfileId = profileForId(data.activeProfileId) ? data.activeProfileId : ""
     normalizeLanguagePair()
     syncLanguageSelectors()
     syncBarIconVisibility()
@@ -359,7 +436,7 @@ Item {
   function savePreferences(params, done) {
     preferenceGeneration += 1
     var responseRevisions = ({})
-    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId", "profiles"]
+    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "reviewTranslation", "openaiReasoningEffort", "activeProfileId", "profiles"]
     for (var i = 0; i < fields.length; i++) {
       var field = fields[i]
       if (!Object.prototype.hasOwnProperty.call(params, field)) continue
@@ -371,7 +448,11 @@ Item {
       responseRevisions.openaiApiKey = preferenceFieldRevisions.openaiApiKey
     }
     run("preferences.set", params, function(reply) {
-      if (showReply(reply) && reply.data) applyPreferenceResult(params, reply.data, responseRevisions)
+      if (reply && reply.ok) {
+        if (reply.data) applyPreferenceResult(params, reply.data, responseRevisions)
+        // A queued settings save must not erase the explanation for a failed review.
+        if (reviewRetryRequest === null) showReply(reply)
+      } else showReply(reply)
       if (done) done(reply)
     })
   }
@@ -383,13 +464,13 @@ Item {
       shortcuts: shortcuts,
       showBarIcon: showBarIcon,
       showHotkeys: showHotkeys,
+      reviewTranslation: reviewTranslation,
       openaiApiKeyConfigured: openaiApiKeyConfigured,
       openaiReasoningEffort: openaiReasoningEffort,
-      translationContexts: translationContexts,
-      selectedContextId: selectedContextId,
+      activeProfileId: activeProfileId,
       profiles: profiles
     }
-    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "openaiReasoningEffort", "translationContexts", "selectedContextId", "profiles"]
+    var fields = ["sourceLanguage", "targetLanguage", "translator", "shortcuts", "showBarIcon", "showHotkeys", "reviewTranslation", "openaiReasoningEffort", "activeProfileId", "profiles"]
     for (var i = 0; i < fields.length; i++) {
       var field = fields[i]
       // A later queued save may already have changed this field locally.
@@ -408,188 +489,182 @@ Item {
     openaiReasoningEffort = value
     savePreferences({openaiReasoningEffort: value})
   }
-  function setSelectedContext(value) {
-    if (value !== "" && !contextForId(value)) return
-    if (commitDisplayedLanguages()) saveLanguages()
-    selectedContextId = value
-    savePreferences({selectedContextId: value})
-  }
-  function openContexts() {
-    if (!usesLlm()) return
-    setupOpen = false
-    profilesOpen = false
-    contextsOpen = true
-    contextEditorOpen = false
-    contextSelectedIndex = 0
-    contextDeleteConfirmationId = ""
-    contextsError = ""
-    Qt.callLater(function() { newContextButton.forceActiveFocus() })
-  }
-  function closeContexts() {
-    contextsOpen = false
-    contextEditorOpen = false
-    contextSelectedIndex = 0
-    contextDeleteConfirmationId = ""
-    contextsError = ""
-    Qt.callLater(function() { sourceBox.forceActiveFocus() })
-  }
-  function startNewContext() {
-    if (translationContexts.length >= 20) { contextsError = "Keep at most 20 contexts."; return }
-    editingContextId = ""
-    contextEditorOpen = true
-    contextDeleteConfirmationId = ""
-    contextsError = ""
-    contextNameField.text = ""
-    contextInstructionField.text = ""
-    Qt.callLater(function() { contextNameField.forceActiveFocus() })
-  }
-  function editContext(id) {
-    var context = contextForId(id)
-    if (!context) return
-    editingContextId = context.id
-    contextEditorOpen = true
-    contextDeleteConfirmationId = ""
-    contextsError = ""
-    contextNameField.text = context.name
-    contextInstructionField.text = context.instruction
-    Qt.callLater(function() { contextNameField.forceActiveFocus() })
-  }
-  function selectContext(id) {
-    if (id !== "" && !contextForId(id)) return
-    setSelectedContext(id)
-    closeContexts()
-  }
-  function saveContext() {
-    var name = contextNameField.text.trim()
-    var instruction = contextInstructionField.text.trim()
-    if (name === "" || instruction === "") { contextsError = "Give the context both a name and an instruction."; return }
-    if (commitDisplayedLanguages()) saveLanguages()
-    var id = editingContextId === "" ? newContextId() : editingContextId
-    var contexts = []
-    for (var i = 0; i < translationContexts.length; i++)
-      if (translationContexts[i].id !== id) contexts.push(translationContexts[i])
-    contexts.push({id: id, name: name, instruction: instruction})
-    selectedContextId = id
-    savePreferences({translationContexts: contexts, selectedContextId: id}, function(reply) {
-      if (reply && reply.ok) {
-        contextEditorOpen = false
-        contextSelectedIndex = 3 + translationContexts.findIndex(function(context) { return context.id === id }) * 3
-        contextsError = ""
-      } else contextsError = reply && reply.error ? reply.error.message : "Could not save translation context."
-    })
-  }
-  function removeContext(id) {
-    if (contextDeleteConfirmationId !== id) { contextDeleteConfirmationId = id; return }
-    var contexts = translationContexts.filter(function(context) { return context.id !== id })
-    var nextSelectedId = selectedContextId === id ? "" : selectedContextId
-    savePreferences({translationContexts: contexts, selectedContextId: nextSelectedId}, function(reply) {
-      if (reply && reply.ok) {
-        contextDeleteConfirmationId = ""
-        contextSelectedIndex = Math.min(contextSelectedIndex, 2 + translationContexts.length * 3)
-        contextsError = ""
-      } else contextsError = reply && reply.error ? reply.error.message : "Could not remove translation context."
-    })
-  }
-  function moveContextSelection(direction) {
-    if (!contextsOpen || contextEditorOpen) return
-    var count = 3 + translationContexts.length * 3
-    contextSelectedIndex = (contextSelectedIndex + direction + count) % count
-    Qt.callLater(function() {
-      if (contextSelectedIndex === 0) newContextButton.forceActiveFocus()
-      else if (contextSelectedIndex === 1) backContextButton.forceActiveFocus()
-      else if (contextSelectedIndex === 2) noContextButton.forceActiveFocus()
-      else {
-        var contextIndex = Math.floor((contextSelectedIndex - 3) / 3)
-        var item = contextRepeater.itemAt(contextIndex)
-        if (!item) return
-        var action = (contextSelectedIndex - 3) % 3
-        if (action === 0 && item.selectButton) item.selectButton.forceActiveFocus()
-        else if (action === 1 && item.editButton) item.editButton.forceActiveFocus()
-        else if (action === 2 && item.deleteButton) item.deleteButton.forceActiveFocus()
-      }
-    })
-  }
   function openProfiles() {
     setupOpen = false
-    contextsOpen = false
     profilesOpen = true
     creatingProfile = false
+    editingProfileId = ""
     profileSelectedIndex = 0
     profileDeleteConfirmationId = ""
     profilesError = ""
-    Qt.callLater(function() { newProfileButton.forceActiveFocus() })
+    focusProfileSelection()
   }
   function closeProfiles() {
     profilesOpen = false
     creatingProfile = false
+    editingProfileId = ""
     profileSelectedIndex = 0
     profileDeleteConfirmationId = ""
     profilesError = ""
     Qt.callLater(function() { sourceBox.forceActiveFocus() })
   }
   function startNewProfile() {
+    if (busy) return
     if (profiles.length >= 20) { profilesError = "Keep at most 20 profiles."; return }
     creatingProfile = true
+    profileSelectedIndex = profiles.length
+    openProfileForm("", translator, sourceLanguage, targetLanguage, activeProfileInstruction())
+  }
+  function openProfileForm(name, engine, source, target, instruction) {
     profileDeleteConfirmationId = ""
     profilesError = ""
-    profileNameField.text = ""
+    profileDraftTranslator = engine
+    profileDraftSource = source
+    profileDraftTarget = target
+    profileNameField.text = name
+    profileInstructionField.text = instruction
+    syncProfileDraftPickers()
     Qt.callLater(function() { profileNameField.forceActiveFocus() })
   }
+  function cancelProfileForm() {
+    creatingProfile = false
+    editingProfileId = ""
+    profilesError = ""
+    focusProfileSelection()
+  }
+  function profileNameTaken(name, exceptId) {
+    var normalized = name.toLowerCase()
+    return profiles.some(function(profile) { return profile.id !== exceptId && profile.name.toLowerCase() === normalized })
+  }
+  function startEditProfile() {
+    var profile = shownProfile
+    if (busy || !profile) return
+    editingProfileId = profile.id
+    openProfileForm(profile.name, profile.translator, profile.sourceLanguage, profile.targetLanguage, profile.instruction)
+  }
+  function profileDraftUsesLlm() { return translatorUsesLlm(profileDraftTranslator) }
+  function languageDropdownOptions(items) { return items.map(function(item) { return {value: item[0], label: item[1]} }) }
+  function profileTranslatorOptions() {
+    return translatorOptions().filter(function(option) { return !option.section })
+      .map(function(option) { return {value: option.id, label: option.label} })
+  }
+  function setProfileDraft(field, value) {
+    if (field === "translator") profileDraftTranslator = value
+    else if (field === "source") profileDraftSource = value
+    else profileDraftTarget = value
+    var sources = sourceCodes(profileDraftTranslator)
+    if (sources.length > 0 && sources.indexOf(profileDraftSource) < 0) profileDraftSource = sources[0]
+    var targets = targetCodes(profileDraftSource, profileDraftTranslator)
+    if (targets.length > 0 && targets.indexOf(profileDraftTarget) < 0) profileDraftTarget = targets[0]
+    syncProfileDraftPickers()
+  }
+  // The dropdowns overwrite a value binding on selection, so a change to one
+  // draft field (a translator with fewer pairs) has to be pushed to the others.
+  function syncProfileDraftPickers() {
+    profileTranslatorDropdown.value = profileDraftTranslator
+    profileSourceDropdown.value = profileDraftSource
+    profileTargetDropdown.value = profileDraftTarget
+  }
   function saveProfile() {
+    var id = editingProfile ? editingProfileId : newProfileId()
     var name = profileNameField.text.trim()
     if (name === "") { profilesError = "Give the profile a short name."; return }
-    var next = profiles.concat([{id: newProfileId(), name: name, translator: translator,
-      sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, selectedContextId: selectedContextId}])
+    if (profileNameTaken(name, id)) { profilesError = "Another profile already uses that name."; return }
+    if (profileInstructionLength > maxProfileInstructionChars) { profilesError = "Shorten the instructions to 11,000 characters before saving."; return }
+    var saved = {id: id, name: name, translator: profileDraftTranslator, sourceLanguage: profileDraftSource,
+      targetLanguage: profileDraftTarget, instruction: profileInstructionField.text.trim()}
+    var next = editingProfile
+      ? profiles.map(function(profile) { return profile.id === id ? saved : profile })
+      : profiles.concat([saved])
     savePreferences({profiles: next}, function(reply) {
-      if (reply && reply.ok) { creatingProfile = false; profilesError = "" }
+      if (reply && reply.ok) {
+        creatingProfile = false
+        editingProfileId = ""
+        profileSelectedIndex = profileDisplayIndex(id)
+        profilesError = ""
+        focusProfileSelection()
+      }
       else profilesError = reply && reply.error ? reply.error.message : "Could not save profile."
     })
   }
   function loadProfile(id) {
+    if (busy) return
     var profile = profileForId(id)
     if (!profile) return
-    var contextId = contextForId(profile.selectedContextId) ? profile.selectedContextId : ""
     savePreferences({translator: profile.translator, sourceLanguage: profile.sourceLanguage,
-      targetLanguage: profile.targetLanguage, selectedContextId: contextId}, function(reply) {
+      targetLanguage: profile.targetLanguage, activeProfileId: id}, function(reply) {
       if (reply && reply.ok) closeProfiles()
       else profilesError = reply && reply.error ? reply.error.message : "Could not load profile."
     })
   }
   function removeProfile(id) {
+    if (busy) return
     if (profileDeleteConfirmationId !== id) { profileDeleteConfirmationId = id; return }
     var next = profiles.filter(function(profile) { return profile.id !== id })
-    savePreferences({profiles: next}, function(reply) {
+    savePreferences({profiles: next, activeProfileId: activeProfileId === id ? "" : activeProfileId}, function(reply) {
       if (reply && reply.ok) {
         profileDeleteConfirmationId = ""
-        profileSelectedIndex = Math.min(profileSelectedIndex, 1 + next.length * 2)
+        profileSelectedIndex = Math.min(profileSelectedIndex, next.length)
         profilesError = ""
+        focusProfileSelection()
       }
       else profilesError = reply && reply.error ? reply.error.message : "Could not remove profile."
     })
   }
-  function moveProfileSelection(direction) {
-    if (!profilesOpen || creatingProfile) return
-    var count = 2 + profiles.length * 2
-    profileSelectedIndex = (profileSelectedIndex + direction + count) % count
-    Qt.callLater(function() {
-      if (profileSelectedIndex === 0) newProfileButton.forceActiveFocus()
-      else if (profileSelectedIndex === 1) backProfileButton.forceActiveFocus()
-      else {
-        var profileIndex = Math.floor((profileSelectedIndex - 2) / 2)
-        var item = profileRepeater.itemAt(profileIndex)
-        if (!item) return
-        if ((profileSelectedIndex - 2) % 2 === 0 && item.loadButton) item.loadButton.forceActiveFocus()
-        else if (item.deleteButton) item.deleteButton.forceActiveFocus()
-      }
+  function clearActiveProfile() {
+    if (busy) return
+    savePreferences({activeProfileId: ""}, function(reply) {
+      if (!reply || !reply.ok) profilesError = reply && reply.error ? reply.error.message : "Could not update the active profile."
     })
   }
-  function selectedProfile() {
-    return profileSelectedIndex >= 2 ? profiles[Math.floor((profileSelectedIndex - 2) / 2)] : null
+  function setProfileSelection(index) {
+    if (profileFormOpen) return
+    if (index !== profileSelectedIndex) {
+      profileDeleteConfirmationId = ""
+      profilesError = ""
+    }
+    profileSelectedIndex = index
+    ensureProfileVisible()
+  }
+  function ensureProfileVisible() {
+    var item = profileRepeater.itemAt(profileSelectedIndex)
+    if (!item) return
+    if (item.y < profileListFlickable.contentY) profileListFlickable.contentY = item.y
+    else if (item.y + item.height > profileListFlickable.contentY + profileListFlickable.height)
+      profileListFlickable.contentY = item.y + item.height - profileListFlickable.height
+  }
+  function focusProfileSelection() {
+    Qt.callLater(function() {
+      var item = profileRepeater.itemAt(profileSelectedIndex)
+      if (item) item.rowButton.forceActiveFocus()
+      else newProfileButton.forceActiveFocus()
+      ensureProfileVisible()
+    })
+  }
+  function moveProfileSelection(direction) {
+    if (!profilesOpen || profileFormOpen) return
+    var count = profiles.length + 1
+    setProfileSelection((profileSelectedIndex + direction + count) % count)
+    focusProfileSelection()
+  }
+  function selectedProfile() { return shownProfile }
+  function profileChangeNote(field) {
+    var profile = shownProfile
+    if (!profile) return ""
+    var changed = false
+    if (field === "translator") changed = profile.translator !== translator
+    else if (field === "languages") changed = profile.sourceLanguage !== sourceLanguage || profile.targetLanguage !== targetLanguage
+    else changed = profile.instruction !== activeProfileInstruction()
+    return changed ? "changes" : "same"
+  }
+  function activateProfilePrimary() {
+    if (profileFormOpen) saveProfile()
+    else if (shownProfile) loadProfile(shownProfile.id)
+    else startNewProfile()
   }
   function setTranslator(value) {
     if (!engineFor(value)) return
     translator = value
-    if (!usesLlm() && contextsOpen) closeContexts()
     if (settingsControls[settingsSelectedIndex] && !settingsControls[settingsSelectedIndex].visible)
       settingsSelectedIndex = 0
     normalizeLanguagePair()
@@ -650,7 +725,6 @@ Item {
   }
   function openSetup() {
     profilesOpen = false
-    contextsOpen = false
     setupOpen = true
     settingsSelectedIndex = 0
     recordingAction = ""
@@ -677,7 +751,7 @@ Item {
   }
   function focusMainSelection() {
     Qt.callLater(function() {
-      if (!opened || setupOpen || profilesOpen || contextsOpen) return
+      if (!opened || setupOpen || profilesOpen) return
       var control = mainControls[mainSelectedIndex]
       if (!control) return
       if (typeof control.focusControl === "function") control.focusControl()
@@ -700,9 +774,9 @@ Item {
     })
   }
   function canPerform(action) {
-    if (setupOpen || profilesOpen || contextsOpen) return false
+    if (setupOpen || profilesOpen) return false
     if (action === "switch") return !busy
-    if (action === "translate") return canTranslate
+    if (action === "translate") return translating || canTranslate
     if (action === "undo") return clearUndoAvailable && !busy
     if (action === "clear") return !busy && (sourceBox.text.length > 0 || translatedText.length > 0)
     if (action === "copy" || action === "copyAll") return !busy && translatedText.length > 0
@@ -728,25 +802,68 @@ Item {
   }
   function handleActionShortcut(event) { return performAction(actionForShortcut(event)) }
   function translate() {
+    if (translating) { stopTranslation("cancelled"); return }
     if (!canTranslate) return
     if (commitDisplayedLanguages()) saveLanguages()
     message = ""
+    reviewRetryRequest = null
     var request = {
       text: sourceBox.text,
       translator: translator,
       sourceLanguage: sourceLanguage,
       targetLanguage: targetLanguage,
-      selectedContextId: selectedContextId,
+      activeProfileId: activeProfileId,
+      customContext: activeProfileInstruction(),
+      reviewTranslation: reviewTranslation,
       openaiReasoningEffort: openaiReasoningEffort
     }
     run("translate", request, function(reply) {
+      finishTranslation(request, reply)
+    })
+  }
+  function finishTranslation(request, reply) {
       if (!translationRequestIsCurrent(request)) {
         message = "Translation discarded because the text or settings changed."
         messageError = false
         return
       }
-      if (showReply(reply)) translatedText = String(reply.data.translation || "")
-    })
+      if (translationReviewEnabled && reply && reply.ok
+          && (!reply.data || reply.data.reviewed !== true || typeof reply.data.translation !== "string" || reply.data.translation.trim() === "")) {
+        reply = {ok: false, error: {code: "review_failed",
+          message: "The helper did not return a validated review. Retry review without translating again."}}
+      }
+      if (reply && reply.ok) {
+        if (showReply(reply)) {
+          translatedText = String(reply.data.translation || "")
+          if (reply.data.reviewed === true)
+            message = reply.data.reviewChanged === true ? "Reviewed: accuracy corrections applied." : "Reviewed: no corrections needed."
+        }
+        reviewRetryRequest = null
+      } else if (translationReviewEnabled) {
+        translatedText = ""
+        if (reply && reply.reviewRequest) reviewRetryRequest = Object.assign({}, request, reply.reviewRequest)
+        var detail = reply && reply.error ? reply.error.message : "The helper did not return a valid response."
+        if (reviewRetryRequest !== null) {
+          message = reply && reply.error && reply.error.code === "review_failed" ? detail
+            : "Translation succeeded, but review did not complete. " + detail + " Draft retained. Retry review without translating again."
+        } else message = detail
+        messageError = !(reply && reply.error && reply.error.code === "cancelled")
+      } else if (reply && !reply.ok && reply.error && (reply.error.code === "cancelled" || reply.error.code === "timeout")) {
+        if (translationPreview.length > 0) translatedText = translationPreview
+        message = reply.error.message + (translationPreview.length > 0 ? " Partial translation shown." : "")
+        messageError = reply.error.code !== "cancelled"
+      } else showReply(reply)
+  }
+  function retryReview() {
+    if (!canRetryReview) return
+    var request = Object.assign({}, reviewRetryRequest)
+    message = ""
+    run("review", request, function(reply) { finishTranslation(request, reply) })
+  }
+  function stopTranslation(reason) {
+    if (!translating || bridge.stoppedReason !== "") return
+    bridge.stoppedReason = reason
+    bridge.running = false
   }
   function swap() {
     if (busy) return
@@ -774,6 +891,7 @@ Item {
     restoringClear = true
     sourceBox.text = ""
     translatedText = ""
+    reviewRetryRequest = null
     restoringClear = false
     message = ""
     messageError = false
@@ -792,8 +910,8 @@ Item {
   function open(payload) {
     setupOpen = false
     profilesOpen = false
-    contextsOpen = false
     creatingProfile = false
+    editingProfileId = ""
     profileDeleteConfirmationId = ""
     profilesError = ""
     mainSelectedIndex = 3
@@ -808,8 +926,8 @@ Item {
   function toggle() { opened ? dismiss() : open("{}") }
 
   Component.onCompleted: {
-    mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextButton, clearButton, copyButton, copyAllButton, translateButton]
-    settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton, barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton]
+    mainControls = [fromPicker, switchButton, toPicker, sourceBox, activeProfileButton, clearButton, copyButton, copyAllButton, translateButton]
+    settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton, barIconSwitch, hotkeysSwitch, copyRecorder, copyAllRecorder, switchRecorder, clearRecorder, translateRecorder, undoRecorder, restoreButton, reviewTranslationSwitch]
     run("engines.get", {}, function(reply) {
       if (reply && reply.ok) engines = reply.data || []
       var initialGeneration = preferenceGeneration
@@ -835,22 +953,62 @@ Item {
     onTriggered: root.copiedAction = ""
   }
 
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.translating
+    onTriggered: root.translationElapsedSeconds = Math.floor((Date.now() - root.translationStartedAt) / 1000)
+  }
+  Timer {
+    id: translationDeadline
+    interval: root.translationStage === "reviewing" ? 900000 : 300000
+    running: root.translating && bridge.translationRequest !== null && bridge.translationRequest.translator === "ollama"
+    onTriggered: root.stopTranslation("timeout")
+  }
+
   Process {
     id: bridge
     property string payload: ""
     property var done: null
     property string responseText: ""
+    property string stoppedReason: ""
+    property var translationRequest: null
     stdinEnabled: true
     onStarted: {
       write(payload + "\n")
       payload = ""
     }
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
-      bridge.responseText = text
-    }}
+    stdout: SplitParser {
+      onRead: function(data) {
+        var event = null
+        try { event = JSON.parse(data) } catch (e) { return }
+        if (event && (event.event === "progress" || event.event === "draft" || event.event === "stage")) {
+          if (root.translating && bridge.stoppedReason === "" && bridge.translationRequest
+              && root.translationRequestIsCurrent(bridge.translationRequest)) {
+            if (event.event === "draft" && root.translationReviewEnabled && typeof event.draft === "string") {
+              root.reviewRetryRequest = Object.assign({}, bridge.translationRequest, {draft: event.draft, reviewTranslation: true})
+            } else if (event.event === "stage" && event.stage === "reviewing") {
+              root.translationStage = "reviewing"
+              root.translationGeneratedCharacters = 0
+              if (bridge.translationRequest.translator === "ollama") translationDeadline.restart()
+            } else if (event.event === "progress") {
+              if (typeof event.characters === "number") root.translationGeneratedCharacters = event.characters
+              else if (typeof event.delta === "string") {
+                root.translationGeneratedCharacters += Array.from(event.delta).length
+                if (!root.translationReviewEnabled) root.translationPreview += event.delta
+              }
+            }
+          }
+        } else bridge.responseText = data
+      }
+    }
     onExited: function(code) {
       var reply = null
-      if (code === 0) {
+      if (bridge.stoppedReason !== "") {
+        reply = {ok: false, error: {code: bridge.stoppedReason,
+          message: bridge.stoppedReason === "cancelled" ? "Translation cancelled."
+            : root.translationStage === "reviewing" ? "Review timed out after 15 minutes." : "Translation timed out after five minutes."}}
+      } else if (code === 0) {
         try { reply = JSON.parse(bridge.responseText.trim()) } catch (e) { reply = null }
       } else {
         reply = {ok: false, error: {code: "helper_failed", message: "The translator helper failed to run."}}
@@ -860,7 +1018,7 @@ Item {
       bridge.responseText = ""
       root.busy = false
       root.translating = false
-      if (code !== 0) {
+      if (code !== 0 && bridge.stoppedReason === "") {
         root.message = reply.error.message
         root.messageError = true
       }
@@ -925,14 +1083,8 @@ Item {
     Shortcut {
       sequence: "Ctrl+Shift+P"
       context: Qt.WindowShortcut
-      enabled: root.opened && !root.contextsOpen && root.recordingAction === ""
+      enabled: root.opened && root.recordingAction === ""
       onActivated: root.profilesOpen ? root.closeProfiles() : root.openProfiles()
-    }
-    Shortcut {
-      sequence: "Ctrl+Shift+X"
-      context: Qt.WindowShortcut
-      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.usesLlm() && !root.busy
-      onActivated: root.contextsOpen ? root.closeContexts() : root.openContexts()
     }
     Shortcut {
       sequence: "Ctrl+J"
@@ -947,47 +1099,42 @@ Item {
       onActivated: root.moveSettingsSelection(-1)
     }
     Shortcut {
-      sequence: "Ctrl+J"
+      sequence: "E"
       context: Qt.WindowShortcut
-      enabled: root.contextsOpen && !root.contextEditorOpen && root.recordingAction === ""
-      onActivated: root.moveContextSelection(1)
-    }
-    Shortcut {
-      sequence: "Ctrl+K"
-      context: Qt.WindowShortcut
-      enabled: root.contextsOpen && !root.contextEditorOpen && root.recordingAction === ""
-      onActivated: root.moveContextSelection(-1)
+      enabled: root.opened && root.profilesOpen && !root.profileFormOpen && !root.busy
+        && root.shownProfile !== null && root.recordingAction === ""
+      onActivated: root.startEditProfile()
     }
     Shortcut {
       sequence: "Ctrl+J"
       context: Qt.WindowShortcut
-      enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""
+      enabled: root.profilesOpen && !root.profileFormOpen && root.recordingAction === ""
       onActivated: root.moveProfileSelection(1)
     }
     Shortcut {
       sequence: "Ctrl+K"
       context: Qt.WindowShortcut
-      enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""
+      enabled: root.profilesOpen && !root.profileFormOpen && root.recordingAction === ""
       onActivated: root.moveProfileSelection(-1)
     }
     Shortcut {
       sequence: "Ctrl+J"
       context: Qt.WindowShortcut
-      enabled: root.opened && !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.recordingAction === ""
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
       onActivated: root.moveMainSelection(1)
     }
     Shortcut {
       sequence: "Ctrl+K"
       context: Qt.WindowShortcut
-      enabled: root.opened && !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.recordingAction === ""
+      enabled: root.opened && !root.setupOpen && !root.profilesOpen && root.recordingAction === ""
       onActivated: root.moveMainSelection(-1)
     }
     Rectangle { anchors.fill: parent; color: Color.menu.scrim }
     MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
     BorderSurface {
       id: card
-      width: Math.min(900, panel.width - Style.gapsOut * 2)
-      height: Math.min(690, panel.height - Style.gapsOut * 2, content.implicitHeight + contentTopInset + contentBottomInset)
+      width: Math.min(root.profileFormOpen ? 1100 : 900, panel.width - Style.gapsOut * 2)
+      height: Math.min(root.profileFormOpen ? 960 : 690, panel.height - Style.gapsOut * 2, content.implicitHeight + contentTopInset + contentBottomInset)
       anchors.centerIn: parent
       color: Color.menu.background
       borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
@@ -997,19 +1144,15 @@ Item {
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Escape && root.recordingAction === "") {
-          if (root.profilesOpen) root.closeProfiles()
-          else if (root.contextsOpen) root.closeContexts()
+          if (root.profilesOpen && root.profileFormOpen) root.cancelProfileForm()
+          else if (root.profilesOpen && root.profileDeleteConfirmationId !== "") root.profileDeleteConfirmationId = ""
+          else if (root.profilesOpen) root.closeProfiles()
           else if (root.setupOpen) root.closeSetup()
           else root.dismiss()
           event.accepted = true
         }
-        else if (root.profilesOpen && !root.creatingProfile && event.key === Qt.Key_Delete && root.selectedProfile()) {
+        else if (root.profilesOpen && !root.profileFormOpen && event.key === Qt.Key_Delete && root.selectedProfile()) {
           root.removeProfile(root.selectedProfile().id)
-          event.accepted = true
-        }
-        else if (root.contextsOpen && !root.contextEditorOpen && event.key === Qt.Key_Delete && root.contextSelectedIndex >= 3) {
-          var item = root.translationContexts[Math.floor((root.contextSelectedIndex - 3) / 3)]
-          if (item) root.removeContext(item.id)
           event.accepted = true
         }
         else if (root.handleActionShortcut(event)) event.accepted = true
@@ -1032,14 +1175,22 @@ Item {
         RowLayout {
           Layout.fillWidth: true
           Label { text: "󰗊"; color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading * 1.35; font.bold: true }
-          Label { text: root.profilesOpen ? "Translation Profiles" : (root.contextsOpen ? "Translation Contexts" : (root.setupOpen ? "Quick Translate Setup" : "Quick Translate")); color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
+          Label { text: root.profilesOpen ? "Translation Profiles" : (root.setupOpen ? "Quick Translate Setup" : "Quick Translate"); color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.bold: true; Layout.fillWidth: true }
+          Label {
+            visible: root.profilesOpen
+            text: root.profiles.length + " of 20"
+            color: Color.menu.text
+            opacity: .68
+            font.family: Style.font.menuFamily
+            font.pixelSize: Style.font.caption
+          }
           Button {
-            visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+            visible: !root.setupOpen && !root.profilesOpen
             text: root.showHotkeys ? "󰀻  Ctrl+Shift+P" : "󰀻"
             onClicked: root.openProfiles()
           }
           Button {
-            visible: !root.profilesOpen && !root.contextsOpen
+            visible: !root.profilesOpen
             text: root.setupOpen ? (root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍") : (!root.showHotkeys ? "󰒓" : "󰒓  Ctrl+?")
             onClicked: root.setupOpen ? root.closeSetup() : root.openSetup()
           }
@@ -1049,7 +1200,7 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           ComboBox {
             id: fromPicker
@@ -1095,7 +1246,7 @@ Item {
         }
         Item { Layout.preferredHeight: Style.spacing.md }
         ScrollView {
-          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           TextArea {
@@ -1126,19 +1277,18 @@ Item {
           }
         }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           Item { Layout.fillWidth: true }
           Label { visible: root.showHotkeys; text: "Ctrl+J/K select"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           Label { text: root.activeTranslatorLabel(); color: Color.menu.text; opacity: .75; font.family: Style.font.menuFamily }
-          Label { visible: root.usesLlm() && root.showHotkeys; text: "Ctrl+Shift+X"; color: Color.menu.text; opacity: .65; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           HotkeyButton {
-            id: contextButton
+            id: activeProfileButton
             visible: root.usesLlm()
-            actionText: root.profileContextLabel(root.selectedContextId)
-            compactActionText: root.profileContextLabel(root.selectedContextId)
+            actionText: root.activeProfileLabel()
+            compactActionText: root.activeProfileLabel()
             available: !root.busy
-            onClicked: root.openContexts()
+            onClicked: root.openProfiles()
           }
           ComboBox {
             id: openaiReasoningPicker
@@ -1158,365 +1308,408 @@ Item {
           Label { text: sourceBox.text.length + " / " + root.maxChars.toLocaleString(); color: sourceBox.text.length > root.maxChars ? "#e06c75" : Color.menu.text; opacity: .75 }
         }
         ScrollView {
-          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           Layout.preferredHeight: Math.max(120, Math.min(220, panel.height * .28))
           opacity: .55
-          TextArea { id: outputBox; text: root.translating ? "Translating…" : root.translatedText; readOnly: true; placeholderText: root.showHotkeys ? root.shortcut("translate") + " to translate" : "Translation"; wrapMode: TextEdit.Wrap; selectByMouse: true; color: Color.menu.text; font.family: Style.font.menuFamily }
+          TextArea { id: outputBox; text: root.translating ? (root.translationReviewEnabled ? root.translationStatus : (root.translationPreview || root.translationStatus)) : root.translatedText; textFormat: TextEdit.PlainText; readOnly: true; placeholderText: root.showHotkeys ? root.shortcut("translate") + " to translate" : "Translation"; wrapMode: TextEdit.Wrap; selectByMouse: true; color: Color.menu.text; font.family: Style.font.menuFamily }
         }
-        Label { visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+        Label {
+          visible: root.translating && !root.setupOpen && !root.profilesOpen
+          text: root.translationStatus + " · " + root.shortcut("translate") + " to cancel"
+          color: Color.menu.text
+          Layout.fillWidth: true
+          wrapMode: Text.WordWrap
+        }
+        Label { visible: !root.setupOpen && !root.profilesOpen && root.message !== ""; text: root.message; color: root.messageError ? "#e06c75" : Color.menu.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+        Button {
+          id: retryReviewButton
+          visible: root.reviewRetryRequest !== null && !root.translating && !root.setupOpen && !root.profilesOpen
+          text: "Retry review"
+          bordered: true
+          focusable: true
+          enabled: root.canRetryReview
+          onClicked: root.retryReview()
+        }
         RowLayout {
-          visible: !root.setupOpen && !root.profilesOpen && !root.contextsOpen
+          visible: !root.setupOpen && !root.profilesOpen
           Layout.fillWidth: true
           HotkeyButton { id: clearButton; actionText: "󰆴  Clear"; compactActionText: "󰆴"; hotkeyText: root.shortcut("clear"); reservedText: "󰆴  Clear  " + root.shortcut("clear"); available: !root.busy && (sourceBox.text.length > 0 || root.translatedText.length > 0); visuallyMuted: sourceBox.text.length === 0 && root.translatedText.length === 0; onClicked: root.clearAll() }
           HotkeyButton { id: copyButton; actionText: root.copiedAction === "translation" ? "󰆏  Copied ✓" : "󰆏  Copy translation"; compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"; hotkeyText: root.copiedAction === "translation" ? "" : root.shortcut("copy"); reservedText: "󰆏  Copy translation  " + root.shortcut("copy"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(root.translatedText, "translation") }
           HotkeyButton { id: copyAllButton; actionText: root.copiedAction === "both" ? "󰆏 󰆏  Copied ✓" : "󰆏 󰆏  Copy both"; compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"; hotkeyText: root.copiedAction === "both" ? "" : root.shortcut("copyAll"); reservedText: "󰆏 󰆏  Copy both  " + root.shortcut("copyAll"); available: !root.busy && root.translatedText.length > 0; visuallyMuted: root.translatedText.length === 0; onClicked: root.copy(sourceBox.text + "\n\n" + root.translatedText, "both") }
           Item { Layout.fillWidth: true }
-          HotkeyButton { id: translateButton; actionText: root.translating ? "󰗊  Translating…" : "󰗊  Translate"; compactActionText: root.translating ? "󰗊 …" : "󰗊"; hotkeyText: root.translating ? "" : root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.canTranslate; visuallyMuted: sourceBox.text.trim().length === 0 || sourceBox.text.length > root.maxChars; onClicked: root.translate() }
+          HotkeyButton { id: translateButton; actionText: root.translating ? "Cancel" : "󰗊  Translate"; compactActionText: root.translating ? "Cancel" : "󰗊"; hotkeyText: root.shortcut("translate"); reservedText: "󰗊  Translate  " + root.shortcut("translate"); available: root.translating || root.canTranslate; visuallyMuted: !root.translating && (sourceBox.text.trim().length === 0 || sourceBox.text.length > root.maxChars); onClicked: root.translate() }
         }
         ColumnLayout {
           visible: root.profilesOpen
           Layout.fillWidth: true
           spacing: Style.spacing.md
-          Label {
-            Layout.fillWidth: true
-            text: "Save the current translator, languages, and translation context under a short name."
-            color: Color.menu.text
-            opacity: .80
-            wrapMode: Text.WordWrap
-            font.family: Style.font.menuFamily
-          }
-          Label {
-            visible: root.showHotkeys && !root.creatingProfile
-            text: "Ctrl+J/K select · Enter load/create · Delete remove"
-            color: Color.menu.text
-            opacity: .65
-            font.family: Style.font.menuFamily
-            font.pixelSize: Style.font.caption
-          }
           RowLayout {
             Layout.fillWidth: true
-            Label {
-              text: root.profileSelectedIndex === 0 ? "󰁔" : ""
-              color: Color.menu.text
-              font.family: Style.font.menuFamily
-              Layout.preferredWidth: Style.space(16)
-            }
-            Button {
-              id: newProfileButton
-              focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 0
-              focusable: true
-              text: "New from current settings"
-              bordered: true
-              enabled: !root.busy && root.profiles.length < 20
-              onClicked: root.startNewProfile()
-              onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 0
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                  root.startNewProfile()
-                  event.accepted = true
-                }
-              }
-            }
-            Item { Layout.fillWidth: true }
-            Label {
-              text: root.profileSelectedIndex === 1 ? "󰁔" : ""
-              color: Color.menu.text
-              font.family: Style.font.menuFamily
-              Layout.preferredWidth: Style.space(16)
-            }
-            Button {
-              id: backProfileButton
-              focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 1
-              focusable: true
-              text: "Back"
-              bordered: true
-              onClicked: root.closeProfiles()
-              onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 1
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                  root.closeProfiles()
-                  event.accepted = true
-                }
-              }
-            }
-          }
-          ColumnLayout {
-            visible: root.creatingProfile
-            Layout.fillWidth: true
-            spacing: Style.spacing.sm
-            Label { text: "Profile name"; color: Color.menu.text; font.family: Style.font.menuFamily }
-            RowLayout {
-              Layout.fillWidth: true
-              TextField {
-                id: profileNameField
-                Layout.fillWidth: true
-                maximumLength: 64
-                placeholderText: "e.g. Formal Japanese"
-                onAccepted: root.saveProfile()
-              }
-              Button { text: "Save"; bordered: true; enabled: !root.busy; onClicked: root.saveProfile() }
-              Button { text: "Cancel"; bordered: true; onClicked: { root.creatingProfile = false; root.profilesError = "" } }
-            }
-          }
-          Label {
-            visible: root.profiles.length === 0 && !root.creatingProfile
-            text: "No profiles saved yet."
-            color: Color.menu.text
-            opacity: .75
-            font.family: Style.font.menuFamily
-          }
-          Repeater {
-            id: profileRepeater
-            model: root.profiles
-            delegate: RowLayout {
-              required property var modelData
-              required property int index
-              property var loadButton: profileLoadButton
-              property var deleteButton: profileDeleteButton
-              Layout.fillWidth: true
+            spacing: Style.spacing.md
+            ColumnLayout {
+              Layout.preferredWidth: Style.space(330)
+              Layout.minimumWidth: Style.space(330)
+              Layout.maximumWidth: Style.space(330)
+              Layout.fillHeight: true
+              enabled: !root.profileFormOpen
+              opacity: enabled ? 1 : .55
               spacing: Style.spacing.sm
               Label {
-                text: root.profileSelectedIndex === 2 + index * 2 || root.profileSelectedIndex === 3 + index * 2 ? "󰁔" : ""
+                visible: root.profiles.length === 0
+                text: "No profiles saved yet."
                 color: Color.menu.text
+                opacity: .75
                 font.family: Style.font.menuFamily
-                Layout.preferredWidth: Style.space(16)
               }
-              Button {
-                id: profileLoadButton
-                focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 2 + index * 2
-                focusable: true
+              Flickable {
+                id: profileListFlickable
+                visible: root.profiles.length > 0
                 Layout.fillWidth: true
-                text: modelData.name + "  ·  " + modelData.translator + "  ·  "
-                  + root.nameFor(modelData.sourceLanguage) + " → " + root.nameFor(modelData.targetLanguage)
-                  + "  ·  " + root.profileContextLabel(modelData.selectedContextId)
+                Layout.preferredHeight: Math.min(profileList.implicitHeight, Math.max(Style.space(180), Math.min(Style.space(440), panel.height * .55)))
+                contentHeight: profileList.implicitHeight
+                boundsBehavior: Flickable.StopAtBounds
+                clip: true
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                ColumnLayout {
+                  id: profileList
+                  width: profileListFlickable.width - (profileListFlickable.contentHeight > profileListFlickable.height ? Style.space(12) : 0)
+                  spacing: Style.spacing.sm
+                  Repeater {
+                    id: profileRepeater
+                    model: root.displayProfiles
+                    delegate: ColumnLayout {
+                      id: profileEntry
+                      required property var modelData
+                      required property int index
+                      readonly property var rowButton: profileRow
+                      readonly property bool isSelected: root.profileSelectedIndex === index
+                      Layout.fillWidth: true
+                      spacing: Style.spacing.sm
+                      RowLayout {
+                        visible: root.profileStartsGroup(profileEntry.index)
+                        Layout.fillWidth: true
+                        Layout.topMargin: profileEntry.index > 0 ? Style.spacing.sm : 0
+                        spacing: Style.spacing.sm
+                        Label {
+                          text: root.profilePairLabel(profileEntry.modelData)
+                          color: Color.menu.text
+                          font.family: Style.font.menuFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                          elide: Text.ElideRight
+                          Layout.maximumWidth: Style.space(260)
+                        }
+                        Rectangle {
+                          color: Color.menu.text
+                          opacity: .2
+                          Layout.fillWidth: true
+                          Layout.preferredHeight: 1
+                        }
+                        Label {
+                          text: root.profilePairCount(profileEntry.modelData)
+                          color: Color.menu.text
+                          opacity: .68
+                          font.family: Style.font.menuFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                      Button {
+                        id: profileRow
+                        Layout.fillWidth: true
+                        implicitHeight: Math.max(Style.space(56), profileRowContent.implicitHeight + Style.spacing.sm * 2)
+                        focusable: true
+                        bordered: true
+                        selected: profileEntry.isSelected
+                        onClicked: root.setProfileSelection(index)
+                        onActiveFocusChanged: if (activeFocus) root.setProfileSelection(index)
+                        Keys.priority: Keys.BeforeItem
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                            root.loadProfile(modelData.id)
+                            event.accepted = true
+                          }
+                        }
+                        Shortcut {
+                          sequence: index < 10 ? String((index + 1) % 10) : ""
+                          context: Qt.WindowShortcut
+                          enabled: root.opened && root.profilesOpen && !root.profileFormOpen
+                            && !root.busy && root.recordingAction === "" && index < 10
+                          onActivated: root.loadProfile(modelData.id)
+                        }
+                        RowLayout {
+                          id: profileRowContent
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.spacing.sm + Style.space(2)
+                          anchors.rightMargin: Style.spacing.sm + Style.space(2)
+                          spacing: Style.spacing.sm + Style.space(2)
+                          Rectangle {
+                            opacity: index < 10 ? 1 : 0
+                            color: profileEntry.isSelected ? Color.menu.text : "transparent"
+                            border.width: 1
+                            border.color: Qt.rgba(Color.menu.text.r, Color.menu.text.g, Color.menu.text.b, .35)
+                            radius: Style.cornerRadius
+                            Layout.preferredWidth: Style.space(26)
+                            Layout.preferredHeight: Style.space(26)
+                            Label {
+                              anchors.centerIn: parent
+                              text: String((index + 1) % 10)
+                              color: profileEntry.isSelected ? Color.menu.background : Color.menu.text
+                              font.family: Style.font.menuFamily
+                              font.bold: true
+                            }
+                          }
+                          Label {
+                            text: modelData.name
+                            color: Color.menu.text
+                            font.family: Style.font.menuFamily
+                            font.bold: true
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                          Label {
+                            visible: modelData.id === root.activeProfileId
+                            text: "active"
+                            color: Color.menu.text
+                            opacity: .68
+                            font.family: Style.font.menuFamily
+                            font.pixelSize: Style.font.caption
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              Item { Layout.fillHeight: true }
+              Button {
+                id: newProfileButton
+                Layout.fillWidth: true
+                focusable: true
+                text: "+ New from current settings"
                 bordered: true
-                enabled: !root.busy
-                onClicked: root.loadProfile(modelData.id)
-                onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 2 + index * 2
+                leftAlign: true
+                selected: root.profileSelectedIndex === root.profiles.length
+                onClicked: root.startNewProfile()
+                onActiveFocusChanged: if (activeFocus) root.setProfileSelection(root.profiles.length)
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event) {
                   if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                    root.loadProfile(modelData.id)
+                    root.startNewProfile()
                     event.accepted = true
                   }
                 }
               }
-              Button {
-                id: profileDeleteButton
-                focus: root.profilesOpen && !root.creatingProfile && root.profileSelectedIndex === 3 + index * 2
-                focusable: true
-                text: root.profileDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"
-                bordered: true
-                enabled: !root.busy
-                onClicked: root.removeProfile(modelData.id)
-                onActiveFocusChanged: if (activeFocus) root.profileSelectedIndex = 3 + index * 2
-                Keys.priority: Keys.BeforeItem
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                    root.removeProfile(modelData.id)
-                    event.accepted = true
+            }
+            Rectangle {
+              color: Color.menu.text
+              opacity: .2
+              Layout.preferredWidth: 1
+              Layout.fillHeight: true
+            }
+            ColumnLayout {
+              Layout.fillWidth: true
+              Layout.fillHeight: true
+              Layout.minimumHeight: Style.space(230)
+              spacing: Style.spacing.md
+              Label {
+                Layout.fillWidth: true
+                text: root.editingProfile ? "Edit profile" : (root.shownProfile ? root.shownProfile.name : "New profile")
+                color: Color.menu.text
+                font.family: Style.font.menuFamily
+                font.pixelSize: Style.font.body * 1.15
+                font.bold: true
+                wrapMode: Text.Wrap
+              }
+              Label {
+                visible: !root.shownProfile && !root.profileFormOpen
+                Layout.fillWidth: true
+                text: "Save the current translator, languages, and instructions under a short name."
+                color: Color.menu.text
+                opacity: .68
+                wrapMode: Text.WordWrap
+                font.family: Style.font.menuFamily
+                font.pixelSize: Style.font.caption
+              }
+              Label {
+                visible: !root.profileFormOpen && root.shownProfile !== null && root.shownProfile.id === root.activeProfileId
+                text: "Active profile"
+                color: Color.menu.text
+                opacity: .68
+                font.family: Style.font.menuFamily
+                font.pixelSize: Style.font.caption
+              }
+              ProfileDetailRow {
+                visible: !root.profileFormOpen
+                label: "Translator"
+                value: root.shownProfile ? root.shownProfile.translator : root.translator
+                note: root.profileChangeNote("translator")
+              }
+              ProfileDetailRow {
+                visible: !root.profileFormOpen
+                label: "Languages"
+                value: root.shownProfile ? root.profilePairLabel(root.shownProfile) : root.nameFor(root.sourceLanguage) + " → " + root.nameFor(root.targetLanguage)
+                note: root.profileChangeNote("languages")
+              }
+              ProfileDetailRow {
+                visible: !root.profileFormOpen && root.translatorUsesLlm(root.shownProfile ? root.shownProfile.translator : root.translator)
+                label: "Instructions"
+                value: (root.shownProfile ? root.shownProfile.instruction : root.activeProfileInstruction()) || "None"
+                note: root.profileChangeNote("instruction")
+                maxLines: 4
+              }
+              ColumnLayout {
+                visible: root.profileFormOpen
+                Layout.fillWidth: true
+                spacing: Style.spacing.sm
+                Label { text: "Profile name"; color: Color.menu.text; font.family: Style.font.menuFamily }
+                TextField {
+                  id: profileNameField
+                  Layout.fillWidth: true
+                  maximumLength: 64
+                  placeholderText: "e.g. Formal Japanese"
+                  onAccepted: root.activateProfilePrimary()
+                }
+              }
+              GridLayout {
+                visible: root.profileFormOpen
+                Layout.fillWidth: true
+                columns: 2
+                columnSpacing: Style.spacing.md
+                rowSpacing: Style.spacing.sm
+                Label { text: "Translator"; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(96) }
+                Dropdown {
+                  id: profileTranslatorDropdown
+                  Layout.fillWidth: true
+                  showLabel: false
+                  fontFamily: Style.font.menuFamily
+                  options: root.profileTranslatorOptions()
+                  onChanged: function(value) { root.setProfileDraft("translator", value) }
+                }
+                Label { text: "From"; color: Color.menu.text; font.family: Style.font.menuFamily }
+                SearchableDropdown {
+                  id: profileSourceDropdown
+                  Layout.fillWidth: true
+                  showLabel: false
+                  fontFamily: Style.font.menuFamily
+                  placeholderText: "Search languages..."
+                  options: root.languageDropdownOptions(root.sourceLanguages(root.profileDraftTranslator))
+                  onChanged: function(value) { root.setProfileDraft("source", value) }
+                }
+                Label { text: "To"; color: Color.menu.text; font.family: Style.font.menuFamily }
+                SearchableDropdown {
+                  id: profileTargetDropdown
+                  Layout.fillWidth: true
+                  showLabel: false
+                  fontFamily: Style.font.menuFamily
+                  placeholderText: "Search languages..."
+                  options: root.languageDropdownOptions(root.targetLanguages(root.profileDraftSource, root.profileDraftTranslator))
+                  onChanged: function(value) { root.setProfileDraft("target", value) }
+                }
+              }
+              ColumnLayout {
+                visible: root.profileFormOpen && root.profileDraftUsesLlm()
+                Layout.fillWidth: true
+                spacing: Style.spacing.sm
+                Label { text: "Instructions (optional)"; color: Color.menu.text; font.family: Style.font.menuFamily }
+                ScrollView {
+                  Layout.fillWidth: true
+                  Layout.preferredHeight: Math.min(Math.max(Style.space(240), profileInstructionField.implicitHeight), Math.max(Style.space(180), Math.min(Style.space(420), panel.height * .4)))
+                  contentWidth: availableWidth
+                  TextArea {
+                    id: profileInstructionField
+                    textFormat: TextEdit.PlainText
+                    wrapMode: TextEdit.Wrap
+                    selectByMouse: true
+                    color: Color.menu.text
+                    font.family: Style.font.menuFamily
+                    placeholderText: "e.g. Use polite Japanese and preserve product names."
                   }
+                }
+                Label {
+                  Layout.fillWidth: true
+                  text: root.profileInstructionLength.toLocaleString() + " / " + root.maxProfileInstructionChars.toLocaleString() + " characters"
+                    + (root.profileInstructionLength > root.maxProfileInstructionChars ? " · Over the limit. Shorten the instructions to save."
+                      : root.profileInstructionLength === root.maxProfileInstructionChars ? " · Character limit reached." : "")
+                  color: root.profileInstructionLength >= root.maxProfileInstructionChars ? "#e06c75" : Color.menu.text
+                  font.family: Style.font.menuFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+              Item { Layout.fillHeight: true }
+              Label {
+                visible: root.profilesError !== ""
+                Layout.fillWidth: true
+                text: root.profilesError
+                color: "#e06c75"
+                wrapMode: Text.WordWrap
+                font.family: Style.font.menuFamily
+              }
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.spacing.sm
+                Button {
+                  id: profilePrimaryButton
+                  text: root.profileFormOpen ? "Save" : (root.shownProfile ? "Load profile" : "Create profile")
+                  bordered: true
+                  selected: true
+                  enabled: !root.busy
+                  onClicked: root.activateProfilePrimary()
+                }
+                Button {
+                  id: profileEditButton
+                  visible: root.shownProfile !== null && !root.profileFormOpen
+                  text: "Edit"
+                  bordered: true
+                  enabled: !root.busy
+                  onClicked: root.startEditProfile()
+                }
+                Button {
+                  id: profileDeleteButton
+                  visible: root.shownProfile !== null && !root.profileFormOpen
+                  text: root.shownProfile && root.profileDeleteConfirmationId === root.shownProfile.id ? "Confirm delete" : "Delete"
+                  foreground: root.shownProfile && root.profileDeleteConfirmationId === root.shownProfile.id ? "#e06c75" : Color.menu.text
+                  bordered: true
+                  enabled: !root.busy
+                  onClicked: root.removeProfile(root.shownProfile.id)
+                }
+                Button {
+                  visible: !root.profileFormOpen && root.shownProfile !== null && root.shownProfile.id === root.activeProfileId
+                  text: "Stop using"
+                  bordered: true
+                  enabled: !root.busy
+                  onClicked: root.clearActiveProfile()
+                }
+                Item { Layout.fillWidth: true }
+                Button {
+                  visible: root.profileFormOpen
+                  text: "Cancel"
+                  bordered: true
+                  onClicked: root.cancelProfileForm()
+                }
+                Button {
+                  id: backProfileButton
+                  visible: !root.profileFormOpen
+                  text: "Back"
+                  bordered: true
+                  onClicked: root.closeProfiles()
                 }
               }
             }
           }
           Label {
-            visible: root.profilesError !== ""
-            Layout.fillWidth: true
-            text: root.profilesError
-            color: "#e06c75"
-            wrapMode: Text.WordWrap
-          }
-        }
-        ColumnLayout {
-          visible: root.contextsOpen
-          Layout.fillWidth: true
-          spacing: Style.spacing.md
-          Label {
-            Layout.fillWidth: true
-            text: "Contexts guide Gemma locally and are sent to OpenAI when it is selected."
-            color: Color.menu.text
-            opacity: .80
-            wrapMode: Text.WordWrap
-            font.family: Style.font.menuFamily
-          }
-          Label {
-            visible: root.showHotkeys && !root.contextEditorOpen
-            text: "Ctrl+J/K select · Enter select/edit · Delete remove"
+            visible: root.showHotkeys
+            text: root.profileFormOpen ? "Enter in name saves · Esc cancel"
+              : (root.profiles.length === 0 ? "Enter create · Esc back" : "1–9 / 0 load · Ctrl+J/K select · Enter load/create · E edit · Delete remove · Esc back")
             color: Color.menu.text
             opacity: .65
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.caption
-          }
-          RowLayout {
-            visible: !root.contextEditorOpen
-            Layout.fillWidth: true
-            Label { text: root.contextSelectedIndex === 0 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Button {
-              id: newContextButton
-              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 0
-              focusable: true
-              text: "New context"
-              bordered: true
-              enabled: !root.busy && root.translationContexts.length < 20
-              onClicked: root.startNewContext()
-              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 0
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.startNewContext(); event.accepted = true }
-              }
-            }
-            Item { Layout.fillWidth: true }
-            Label { text: root.contextSelectedIndex === 1 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Button {
-              id: backContextButton
-              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 1
-              focusable: true
-              text: "Back"
-              bordered: true
-              onClicked: root.closeContexts()
-              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 1
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.closeContexts(); event.accepted = true }
-              }
-            }
-          }
-          RowLayout {
-            visible: !root.contextEditorOpen
-            Layout.fillWidth: true
-            Label { text: root.contextSelectedIndex === 2 ? "󰁔" : ""; color: Color.menu.text; font.family: Style.font.menuFamily; Layout.preferredWidth: Style.space(16) }
-            Button {
-              id: noContextButton
-              focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 2
-              focusable: true
-              Layout.fillWidth: true
-              text: "No context"
-              bordered: true
-              enabled: !root.busy
-              onClicked: root.selectContext("")
-              onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 2
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.selectContext(""); event.accepted = true }
-              }
-            }
-          }
-          ColumnLayout {
-            visible: root.contextEditorOpen
-            Layout.fillWidth: true
-            spacing: Style.spacing.sm
-            Label { text: root.editingContextId === "" ? "New context" : "Edit context"; color: Color.menu.text; font.family: Style.font.menuFamily; font.bold: true }
-            RowLayout {
-              Layout.fillWidth: true
-              Label { text: "Name"; color: Color.menu.text; Layout.preferredWidth: 120 }
-              TextField {
-                id: contextNameField
-                Layout.fillWidth: true
-                placeholderText: "e.g. Formal Japanese"
-                maximumLength: 64
-                onAccepted: root.saveContext()
-              }
-            }
-            Label { text: "Instruction"; color: Color.menu.text; Layout.fillWidth: true }
-            ScrollView {
-              Layout.fillWidth: true
-              Layout.preferredHeight: 120
-              TextArea {
-                id: contextInstructionField
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                color: Color.menu.text
-                font.family: Style.font.menuFamily
-                placeholderText: "e.g. Use polite Japanese and preserve product names."
-                onTextChanged: if (text.length > 2000) text = text.slice(0, 2000)
-              }
-            }
-            RowLayout {
-              Layout.fillWidth: true
-              Item { Layout.fillWidth: true }
-              Button { text: "Save context"; bordered: true; enabled: !root.busy; onClicked: root.saveContext() }
-              Button { text: "Cancel"; bordered: true; onClicked: { root.contextEditorOpen = false; root.contextsError = ""; Qt.callLater(function() { root.moveContextSelection(0) }) } }
-            }
-          }
-          Label {
-            visible: root.translationContexts.length === 0 && !root.contextEditorOpen
-            text: "No contexts saved yet."
-            color: Color.menu.text
-            opacity: .75
-            font.family: Style.font.menuFamily
-          }
-          Repeater {
-            id: contextRepeater
-            model: root.contextEditorOpen ? [] : root.translationContexts
-            delegate: RowLayout {
-              required property var modelData
-              required property int index
-              property var selectButton: savedContextSelectButton
-              property var editButton: savedContextEditButton
-              property var deleteButton: savedContextDeleteButton
-              Layout.fillWidth: true
-              spacing: Style.spacing.sm
-              Label {
-                text: root.contextSelectedIndex >= 3 + index * 3 && root.contextSelectedIndex <= 5 + index * 3 ? "󰁔" : ""
-                color: Color.menu.text
-                font.family: Style.font.menuFamily
-                Layout.preferredWidth: Style.space(16)
-              }
-              Button {
-                id: savedContextSelectButton
-                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 3 + index * 3
-                focusable: true
-                Layout.fillWidth: true
-                text: modelData.name
-                bordered: true
-                enabled: !root.busy
-                onClicked: root.selectContext(modelData.id)
-                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 3 + index * 3
-                Keys.priority: Keys.BeforeItem
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.selectContext(modelData.id); event.accepted = true }
-                }
-              }
-              Button {
-                id: savedContextEditButton
-                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 4 + index * 3
-                focusable: true
-                text: "Edit"
-                bordered: true
-                enabled: !root.busy
-                onClicked: root.editContext(modelData.id)
-                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 4 + index * 3
-                Keys.priority: Keys.BeforeItem
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.editContext(modelData.id); event.accepted = true }
-                }
-              }
-              Button {
-                id: savedContextDeleteButton
-                focus: root.contextsOpen && !root.contextEditorOpen && root.contextSelectedIndex === 5 + index * 3
-                focusable: true
-                text: root.contextDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"
-                bordered: true
-                enabled: !root.busy
-                onClicked: root.removeContext(modelData.id)
-                onActiveFocusChanged: if (activeFocus) root.contextSelectedIndex = 5 + index * 3
-                Keys.priority: Keys.BeforeItem
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.removeContext(modelData.id); event.accepted = true }
-                }
-              }
-            }
-          }
-          Label {
-            visible: root.contextsError !== ""
-            Layout.fillWidth: true
-            text: root.contextsError
-            color: "#e06c75"
-            wrapMode: Text.WordWrap
           }
         }
         ColumnLayout {
@@ -1677,6 +1870,35 @@ Item {
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
                   root.restoreShortcutDefaults()
+                  event.accepted = true
+                }
+              }
+            }
+          }
+          RowLayout {
+            Layout.fillWidth: true
+            Label { text: root.settingsSelectedIndex === 12 ? "󰁔" : ""; color: Color.menu.text; Layout.preferredWidth: Style.space(16) }
+            ColumnLayout {
+              Layout.fillWidth: true
+              Label { text: "Review Translation"; color: Color.menu.text }
+              Label {
+                Layout.fillWidth: true
+                text: "Check AI translations for missing information, changed meaning, invented details and incorrect terminology before displaying the result. Correct wording is left unchanged. Uses an additional AI request."
+                color: Color.menu.text
+                opacity: .80
+                wrapMode: Text.WordWrap
+                font.pixelSize: Style.font.caption
+              }
+            }
+            Switch {
+              id: reviewTranslationSwitch
+              checked: root.reviewTranslation
+              function activateSetting() { root.savePreferences({reviewTranslation: !root.reviewTranslation}) }
+              onToggled: if (checked !== root.reviewTranslation) root.savePreferences({reviewTranslation: checked})
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                  activateSetting()
                   event.accepted = true
                 }
               }

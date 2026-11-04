@@ -40,35 +40,75 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(result["data"]["translator"], "reverso")
     self.assertFalse(result["data"]["showHotkeys"])
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"]["translate"], "Ctrl+Enter")
-  def test_translation_context_preferences(self):
+  def test_active_profile_preferences(self):
     self.assertTrue(qt.preferences_set({"sourceLanguage": "ja", "targetLanguage": "en"})["ok"])
-    contexts = [{"id": "formal-ja", "name": "Formal Japanese", "instruction": "Use formal Japanese."}]
-    result = qt.preferences_set({"translationContexts": contexts, "selectedContextId": "formal-ja"})
+    profile = {"id": "formal-ja", "name": "Formal Japanese", "translator": "ollama",
+               "sourceLanguage": "en", "targetLanguage": "ja", "instruction": "Use formal Japanese."}
+    result = qt.preferences_set({"profiles": [profile], "activeProfileId": "formal-ja"})
     self.assertTrue(result["ok"])
-    self.assertEqual(result["data"]["translationContexts"], contexts)
-    self.assertEqual(result["data"]["selectedContextId"], "formal-ja")
+    self.assertEqual(result["data"]["profiles"], [profile])
+    self.assertEqual(result["data"]["activeProfileId"], "formal-ja")
     self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("ja", "en"))
-    self.assertEqual(qt.preferences_set({"selectedContextId": "missing"})["error"]["code"], "invalid_context")
-    self.assertEqual(qt.preferences_set({"translationContexts": [{"id": "bad id", "name": "x", "instruction": "y"}]})["error"]["code"], "invalid_context")
-    duplicate = contexts + [{"id": "casual-ja", "name": "formal japanese", "instruction": "Use casual Japanese."}]
-    self.assertEqual(qt.preferences_set({"translationContexts": duplicate})["error"]["code"], "invalid_context")
-  def test_editing_or_removing_contexts_preserves_languages(self):
-    self.assertTrue(qt.preferences_set({"sourceLanguage": "de", "targetLanguage": "en"})["ok"])
-    contexts = [
-      {"id": "formal", "name": "Formal", "instruction": "Use formal wording."},
-      {"id": "casual", "name": "Casual", "instruction": "Use casual wording."},
-    ]
-    self.assertTrue(qt.preferences_set({"translationContexts": contexts, "selectedContextId": "formal"})["ok"])
-    edited = [{"id": "formal", "name": "Formal", "instruction": "Preserve honorifics."}, contexts[1]]
-    result = qt.preferences_set({"translationContexts": edited, "selectedContextId": "formal"})
+    self.assertEqual(qt.preferences_set({"activeProfileId": "missing"})["error"]["code"], "invalid_profile")
+    self.assertEqual(qt.preferences_set({"activeProfileId": 3})["error"]["code"], "invalid_profile")
+    result = qt.preferences_set({"profiles": []})
     self.assertTrue(result["ok"])
-    self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("de", "en"))
-    result = qt.preferences_set({"translationContexts": [edited[0]], "selectedContextId": ""})
+    self.assertEqual(result["data"]["activeProfileId"], "")
+  def test_profile_instruction_limit_preserves_saved_text(self):
+    instruction = "日🌏" * 5500
+    profile = {"id": "long", "name": "Long profile", "translator": "ollama",
+               "sourceLanguage": "en", "targetLanguage": "ja", "instruction": instruction}
+    result = qt.preferences_set({"profiles": [profile]})
     self.assertTrue(result["ok"])
-    self.assertEqual((result["data"]["sourceLanguage"], result["data"]["targetLanguage"]), ("de", "en"))
-  def test_profile_preferences_and_deleted_context_references(self):
+    self.assertEqual(qt.preferences_get()["data"]["profiles"], [profile])
+    result = qt.preferences_set({"profiles": [{**profile, "instruction": instruction + "x"}]})
+    self.assertFalse(result["ok"])
+    self.assertIn("11,000 characters", result["error"]["message"])
+    self.assertEqual(qt.preferences_get()["data"]["profiles"], [profile])
+  def test_contexts_migrate_into_profiles(self):
+    path = Path(qt.state_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = {
+      "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja", "openaiApiKey": "sk-secret",
+      "selectedContextId": "support",
+      "translationContexts": [
+        {"id": "clients", "name": "Clients", "instruction": "Be polite."},
+        {"id": "support", "name": "Support", "instruction": "Be friendly."},
+        {"id": "spare", "name": "Attached", "instruction": "Unused instructions."},
+      ],
+      "profiles": [
+        {"id": "a", "name": "Attached", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "clients"},
+        {"id": "b", "name": "Reverse", "translator": "ollama", "sourceLanguage": "ja", "targetLanguage": "en", "selectedContextId": "clients"},
+        {"id": "c", "name": "Support", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "support"},
+        {"id": "d", "name": "Plain", "translator": "google", "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": ""},
+        {"id": "e", "name": "Stale", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "deleted"},
+      ],
+    }
+    path.write_text(json.dumps(legacy))
+    data = qt.preferences_get()["data"]
+    self.assertEqual([profile["instruction"] for profile in data["profiles"]],
+                     ["Be polite.", "Be polite.", "Be friendly.", "", "", "Unused instructions."])
+    self.assertEqual(data["profiles"][5]["name"], "Attached (2)")
+    self.assertEqual(data["activeProfileId"], "c")
+    self.assertNotIn("translationContexts", data)
+    self.assertEqual(json.loads(path.read_text()), legacy, "reading must not rewrite the file")
+    self.assertEqual(qt.active_profile_instruction(qt.read_preferences()), "Be friendly.")
+    self.assertTrue(qt.preferences_set({"showHotkeys": False})["ok"])
+    saved = json.loads(path.read_text())
+    self.assertNotIn("translationContexts", saved)
+    self.assertNotIn("selectedContextId", saved)
+    self.assertEqual(saved["openaiApiKey"], "sk-secret")
+    self.assertEqual(saved["activeProfileId"], "c")
+    self.assertEqual(len(saved["profiles"]), 6)
+    backup_path = path.with_name("preferences.before-profile-merge.json")
+    backup = json.loads(backup_path.read_text())
+    self.assertEqual(backup["translationContexts"], legacy["translationContexts"])
+    self.assertNotIn("openaiApiKey", backup)
+    self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+    self.assertEqual(qt.preferences_get()["data"]["profiles"], saved["profiles"])
+  def test_profile_preferences_validation(self):
     profile = {"id": "formal-ja", "name": "Formal Japanese", "translator": "openai",
-               "sourceLanguage": "en", "targetLanguage": "ja", "selectedContextId": "formal-context"}
+               "sourceLanguage": "en", "targetLanguage": "ja", "instruction": ""}
     result = qt.preferences_set({"profiles": [profile]})
     self.assertTrue(result["ok"])
     self.assertEqual(result["data"]["profiles"], [profile])
@@ -91,7 +131,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(result["error"]["code"], "reserved_shortcut")
     self.assertEqual(qt.preferences_get()["data"]["shortcuts"]["switch"], "Ctrl+U")
   def test_rejects_reserved_navigation_editing_and_super_shortcuts(self):
-    for shortcut in ("Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+Shift+P", "Ctrl+Shift+X", "Ctrl+J", "A", "Enter", "Meta+U"):
+    for shortcut in ("Ctrl+Shift+?", "Ctrl+Shift+/", "Ctrl+Shift+P", "Ctrl+J", "A", "Enter", "Meta+U"):
       with self.subTest(shortcut=shortcut):
         self.assertEqual(qt.preferences_set({"shortcuts": {"switch": shortcut}})["error"]["code"], "reserved_shortcut")
   def test_rejects_malformed_shortcuts_and_allows_function_keys(self):
@@ -122,10 +162,17 @@ class QuickTranslateTests(unittest.TestCase):
       opener.return_value.__enter__.return_value = page
       self.assertEqual(qt.bing_credentials(), ("ig", "iid", "-123", "token"))
   @patch("urllib.request.urlopen")
+  def test_surrounding_whitespace_is_not_sent_to_translators(self, opener):
+    response = MagicMock(); response.read.return_value = b'{"message":{"content":"hola"}}'
+    opener.return_value.__enter__.return_value = response
+    result = qt.translate({"text":"\n  testing 1 2 3 \n", "translator":"ollama", "sourceLanguage":"en", "targetLanguage":"es"})
+    self.assertTrue(result["ok"])
+    self.assertIn("\ntesting 1 2 3\n<", json.loads(opener.call_args.args[0].data)["messages"][-1]["content"])
+  @patch("urllib.request.urlopen")
   def test_llm_adapters_and_missing_openai_key(self, opener):
     self.assertEqual(qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})["error"]["code"], "openai_api_key_missing")
-    contexts = [{"id": "formal-ja", "name": "Formal Japanese", "instruction": "Use formal Japanese."}]
-    self.assertTrue(qt.preferences_set({"openaiApiKey":"sk-test", "openaiReasoningEffort":"low", "translationContexts": contexts, "selectedContextId": "formal-ja"})["ok"])
+    profiles = [{"id": "formal-ja", "name": "Formal Japanese", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja", "instruction": "Use formal Japanese."}]
+    self.assertTrue(qt.preferences_set({"openaiApiKey":"sk-test", "openaiReasoningEffort":"low", "profiles": profiles, "activeProfileId": "formal-ja"})["ok"])
     response = MagicMock(); response.read.return_value = b'{"output":[{"type":"message","content":[{"type":"output_text","text":"hola"}]}]}'
     opener.return_value.__enter__.return_value = response
     result = qt.translate({"text":"hello", "translator":"openai", "sourceLanguage":"en", "targetLanguage":"es"})
@@ -134,20 +181,59 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(request.get_header("Authorization"), "Bearer sk-test")
     payload = json.loads(request.data)
     self.assertEqual(payload["reasoning"], {"effort": "low"})
-    self.assertIn("Translate the user's text from English to Spanish", payload["input"][0]["content"])
-    self.assertIn("Additional translation context:\nUse formal Japanese.", payload["input"][0]["content"])
-    self.assertEqual(payload["input"][1]["content"], "hello")
+    self.assertIn("translate text from English to Spanish", payload["input"][0]["content"])
+    self.assertIn("Use formal Japanese.", payload["input"][1]["content"])
+    self.assertEqual([message["role"] for message in payload["input"]], ["developer", "developer", "user"])
+    self.assertIn("\nhello\n", payload["input"][2]["content"])
     response.read.return_value = b'{"message":{"content":"hola"}}'
     result = qt.translate({"text":"hello", "translator":"ollama", "sourceLanguage":"en", "targetLanguage":"es"})
     self.assertEqual(result["data"]["translation"], "hola")
     ollama_payload = json.loads(opener.call_args.args[0].data)
     self.assertEqual(ollama_payload["model"], "gemma3")
+    self.assertEqual(ollama_payload["options"]["num_ctx"], 16384)
+    self.assertEqual(ollama_payload["options"]["temperature"], 0.1)
     self.assertFalse(ollama_payload["stream"])
-    self.assertIn("Additional translation context:\nUse formal Japanese.", ollama_payload["messages"][0]["content"])
-    self.assertTrue(qt.preferences_set({"selectedContextId": ""})["ok"])
+    self.assertEqual(opener.call_args.kwargs["timeout"], 300)
+    self.assertIn("Use formal Japanese.", ollama_payload["messages"][1]["content"])
+    self.assertTrue(qt.preferences_set({"activeProfileId": ""})["ok"])
     result = qt.translate({"text":"hello", "translator":"ollama", "sourceLanguage":"en", "targetLanguage":"es"})
     self.assertEqual(result["data"]["translation"], "hola")
-    self.assertNotIn("Additional translation context:", json.loads(opener.call_args.args[0].data)["messages"][0]["content"])
+    self.assertEqual(len(json.loads(opener.call_args.args[0].data)["messages"]), 2)
+  @patch("urllib.request.urlopen")
+  def test_ollama_stream_reports_unicode_chunks_and_final_text(self, opener):
+    events = []
+    chunks = [{"message": {"content": "こんにちは\n"}, "done": False},
+              {"message": {"content": "世界🌏"}, "done": False}, {"done": True}]
+    raw = b"\n" + b"".join((json.dumps(chunk, ensure_ascii=False) + "\n").encode() for chunk in chunks)
+    opener.return_value = io.BytesIO(raw)
+    result = qt.handle({"operation": "translate", "params": {
+      "text": "Hello world", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja"}},
+      progress=events.append)
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["data"]["translation"], "こんにちは\n世界🌏")
+    self.assertEqual(events, [{"event": "progress", "delta": "こんにちは\n"}, {"event": "progress", "delta": "世界🌏"}])
+    self.assertTrue(json.loads(opener.call_args.args[0].data)["stream"])
+    self.assertEqual(opener.call_args.kwargs["timeout"], 300)
+  @patch("urllib.request.urlopen")
+  def test_ollama_stream_rejects_incomplete_and_invalid_responses(self, opener):
+    for raw in (b'{"message":{"content":"partial"},"done":false}\n',
+                b'{"error":"failed"}\n', b'{"message":null,"done":true}\n', b'bad json\n',
+                b'{"message":{"content":3},"done":true}\n'):
+      with self.subTest(raw=raw):
+        opener.return_value = io.BytesIO(raw)
+        result = qt.translate({"text": "hello", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja"}, progress=lambda event: None)
+        self.assertEqual(result["error"]["code"], "malformed_response")
+    opener.return_value = io.BytesIO(b'{"message":{"content":"partial"},"done":true,"done_reason":"length"}\n')
+    result = qt.translate({"text": "hello", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja"}, progress=lambda event: None)
+    self.assertEqual(result["error"]["code"], "incomplete_translation")
+    opener.side_effect = TimeoutError()
+    result = qt.translate({"text": "hello", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja"}, progress=lambda event: None)
+    self.assertEqual(result["error"]["code"], "timeout")
+  @patch("urllib.request.urlopen")
+  def test_ollama_stream_bounds_response_size(self, opener):
+    opener.return_value = io.BytesIO(b'x' * (qt.MAX_RESPONSE_BYTES + 1))
+    result = qt.translate({"text": "hello", "translator": "ollama", "sourceLanguage": "en", "targetLanguage": "ja"}, progress=lambda event: None)
+    self.assertEqual(result["error"]["code"], "malformed_response")
   def test_same_language_and_unicode_multiline(self):
     text = "こんにちは\nworld 🌏"
     self.assertEqual(qt.translate({"text":text,"sourceLanguage":"ja","targetLanguage":"ja"})["data"]["translation"], text)
@@ -241,7 +327,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('Flickable {', qml)
     self.assertIn('contentHeight: content.implicitHeight', qml)
     self.assertGreaterEqual(qml.count('ScrollView {'), 2)
-    self.assertIn('text: root.translating ? "Translating…" : root.translatedText', qml)
+    self.assertIn('text: root.translating ? (root.translationReviewEnabled ? root.translationStatus : (root.translationPreview || root.translationStatus)) : root.translatedText', qml)
     self.assertNotIn('Label { visible: root.translating; text: "Translating…"', qml)
     self.assertIn('opacity: .55', qml)
     self.assertIn("stdinEnabled: true", qml)
@@ -258,10 +344,9 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertNotIn('How translation works', qml)
     self.assertIn('Google, Apertium, Bing, Reverso, Ollama Local, or OpenAI', qml)
     self.assertIn('id: openaiReasoningPicker', qml)
-    self.assertIn('id: contextButton', qml)
-    self.assertIn('function openContexts()', qml)
-    self.assertIn('function moveContextSelection(direction)', qml)
-    self.assertIn('function saveContext()', qml)
+    self.assertIn('id: activeProfileButton', qml)
+    self.assertNotIn('contextsOpen', qml)
+    self.assertNotIn('translationContexts', qml)
     self.assertIn('label: root.reasoningEffortLabel(effort)', qml)
     self.assertIn('function activeTranslatorLabel()', qml)
     self.assertIn('Ollama Local · Gemma 3', qml)
@@ -269,8 +354,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('unofficial, may change or rate-limit requests', qml)
     self.assertIn('sequence: "Ctrl+?"', qml)
     self.assertIn('sequence: "Ctrl+Shift+P"', qml)
-    self.assertIn('sequence: "Ctrl+Shift+X"', qml)
-    self.assertIn('onActivated: root.contextsOpen ? root.closeContexts() : root.openContexts()', qml)
+    self.assertNotIn('Ctrl+Shift+X', qml)
     self.assertIn('"󰒓  Ctrl+?"', qml)
     self.assertIn('"󰁍  Ctrl+?"', qml)
     self.assertIn('root.showHotkeys ? "󰁍  Ctrl+?" : "󰁍"', qml)
@@ -280,7 +364,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('text: "Ctrl+J/K select"', qml)
     self.assertNotIn('Enter or Space change', qml)
     self.assertIn('settingsControls = [translatorPicker, openaiKeyField, removeOpenaiKeyButton', qml)
-    self.assertIn('mainControls = [fromPicker, switchButton, toPicker, sourceBox, contextButton, clearButton, copyButton, copyAllButton, translateButton]', qml)
+    self.assertIn('mainControls = [fromPicker, switchButton, toPicker, sourceBox, activeProfileButton, clearButton, copyButton, copyAllButton, translateButton]', qml)
     self.assertIn('function moveMainSelection(direction)', qml)
     self.assertIn('function focusMainSelection()', qml)
     self.assertIn('onActivated: root.moveMainSelection(1)', qml)
@@ -319,42 +403,39 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn('actionText: "⇄"', qml)
     self.assertIn('compactActionText: root.copiedAction === "translation" ? "󰆏 ✓" : "󰆏"', qml)
     self.assertIn('compactActionText: root.copiedAction === "both" ? "󰆏 󰆏 ✓" : "󰆏 󰆏"', qml)
-    self.assertIn('compactActionText: root.translating ? "󰗊 …" : "󰗊"', qml)
+    self.assertIn('compactActionText: root.translating ? "Cancel" : "󰗊"', qml)
     self.assertIn('!control.showHotkey ? (control.compactActionText !== "" ? control.compactActionText : control.actionText)', qml)
-  def test_qml_context_manager_selects_edits_and_deletes(self):
-    qml = (HERE / "QuickTranslate.qml").read_text()
-    for function in ("function openContexts()", "function startNewContext()", "function editContext(id)", "function selectContext(id)", "function saveContext()", "function removeContext(id)"):
-      self.assertIn(function, qml)
-    self.assertIn('id: newContextButton', qml)
-    self.assertIn('id: backContextButton', qml)
-    self.assertIn('id: noContextButton', qml)
-    self.assertIn('id: savedContextSelectButton', qml)
-    self.assertIn('id: savedContextEditButton', qml)
-    self.assertIn('id: savedContextDeleteButton', qml)
-    self.assertIn('text: root.contextDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"', qml)
-    self.assertIn('root.selectContext("")', qml)
-    self.assertIn('root.moveContextSelection(1)', qml)
-    self.assertIn('root.moveContextSelection(-1)', qml)
-    self.assertIn('if (commitDisplayedLanguages()) saveLanguages()', qml)
   def test_qml_profiles_create_load_and_delete(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     for function in ("function openProfiles()", "function startNewProfile()", "function saveProfile()", "function loadProfile(id)", "function removeProfile(id)"):
       self.assertIn(function, qml)
     self.assertIn('profiles: profiles', qml)
     self.assertIn('savePreferences({profiles: next}', qml)
-    self.assertIn('text: root.profileDeleteConfirmationId === modelData.id ? "Confirm delete" : "Delete"', qml)
+    self.assertIn('root.profileDeleteConfirmationId === root.shownProfile.id ? "Confirm delete" : "Delete"', qml)
     self.assertIn('text: root.showHotkeys ? "󰀻  Ctrl+Shift+P" : "󰀻"', qml)
     self.assertIn("function moveProfileSelection(direction)", qml)
-    self.assertIn("profileRepeater.itemAt(profileIndex)", qml)
-    self.assertIn("id: newProfileButton\n              focus:", qml)
-    self.assertIn('text: root.profileSelectedIndex === 0 ? "󰁔" : ""', qml)
+    self.assertIn("profileRepeater.itemAt(profileSelectedIndex)", qml)
+    self.assertIn("id: newProfileButton", qml)
     self.assertIn("id: backProfileButton", qml)
-    self.assertIn("id: profileLoadButton", qml)
+    self.assertIn("id: profilePrimaryButton", qml)
     self.assertIn("id: profileDeleteButton", qml)
+    self.assertIn('function profileChangeNote(field)', qml)
+    self.assertIn('root.profilesOpen && root.profileDeleteConfirmationId !== ""', qml)
     self.assertIn("focusable: true", qml)
-    self.assertIn('enabled: root.profilesOpen && !root.creatingProfile && root.recordingAction === ""', qml)
-    self.assertIn('text: "Ctrl+J/K select · Enter load/create · Delete remove"', qml)
+    self.assertIn('enabled: root.profilesOpen && !root.profileFormOpen && root.recordingAction === ""', qml)
+    self.assertIn('"1–9 / 0 load · Ctrl+J/K select · Enter load/create · E edit · Delete remove · Esc back"', qml)
     self.assertIn("event.key === Qt.Key_Delete && root.selectedProfile()", qml)
+    self.assertIn("!root.profileFormOpen && event.key === Qt.Key_Delete", qml)
+    self.assertIn("enabled: root.opened && root.profilesOpen && !root.profileFormOpen\n", qml)
+    self.assertIn("function startEditProfile()", qml)
+    self.assertIn("function clearActiveProfile()", qml)
+    self.assertIn("model: root.displayProfiles", qml)
+    self.assertIn("function groupedProfiles()", qml)
+    self.assertIn("root.profileStartsGroup(profileEntry.index)", qml)
+    self.assertIn("profileSelectedIndex = profileDisplayIndex(id)", qml)
+    self.assertIn("id: profileInstructionField", qml)
+    self.assertIn("customContext: activeProfileInstruction()", qml)
+    self.assertIn("id: profileEditButton", qml)
   def test_qml_reopens_on_the_main_translation_page(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     open_function = qml.split("function open(payload)", 1)[1].split("function close()", 1)[0]
@@ -377,7 +458,7 @@ class QuickTranslateTests(unittest.TestCase):
   def test_qml_discards_a_translation_when_its_inputs_change(self):
     qml = (HERE / "QuickTranslate.qml").read_text()
     matcher = qml.split("function translationRequestIsCurrent(request)", 1)[1].split("function applyPreferences", 1)[0]
-    for field in ("text", "translator", "sourceLanguage", "targetLanguage", "selectedContextId", "openaiReasoningEffort"):
+    for field in ("text", "translator", "sourceLanguage", "targetLanguage", "activeProfileId", "openaiReasoningEffort"):
       self.assertIn("request." + field, matcher)
     translate_function = qml.split("function translate()", 1)[1].split("function swap()", 1)[0]
     self.assertIn("if (!translationRequestIsCurrent(request))", translate_function)
@@ -387,8 +468,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertIn("function commitDisplayedLanguages()", qml)
     translate_function = qml.split("function translate()", 1)[1].split("function swap()", 1)[0]
     self.assertIn("if (commitDisplayedLanguages()) saveLanguages()", translate_function)
-    self.assertIn("function setSelectedContext(value)", qml)
-    self.assertGreaterEqual(qml.count("if (commitDisplayedLanguages()) saveLanguages()"), 2)
+    self.assertGreaterEqual(qml.count("if (commitDisplayedLanguages()) saveLanguages()"), 1)
     source_picker = qml.split("id: fromPicker", 1)[1].split("id: toPicker", 1)[0]
     target_picker = qml.split("id: toPicker", 1)[1].split("Item { Layout.preferredHeight", 1)[0]
     self.assertIn("onActiveFocusChanged:", source_picker)

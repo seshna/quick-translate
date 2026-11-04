@@ -6,16 +6,19 @@ import re
 import subprocess
 import sys
 import tempfile
+import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from translation_prompt import translation_messages
+from review_validation import UNCHANGED, protected_literals, translation_findings, required_terminology, interpret_review
 
 MAX_CHARS = 5000
 MAX_RESPONSE_BYTES = 1024 * 1024
-MAX_CONTEXTS = 20
-MAX_CONTEXT_NAME_LENGTH = 64
-MAX_CONTEXT_INSTRUCTION_LENGTH = 2000
+LEGACY_MAX_CONTEXTS = 20
+LEGACY_MAX_CONTEXT_NAME_LENGTH = 64
+MAX_PROFILE_INSTRUCTION_LENGTH = 11000
 MAX_PROFILES = 20
 MAX_PROFILE_NAME_LENGTH = 64
 WEB_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
@@ -35,10 +38,10 @@ DEFAULTS = {
     "shortcuts": DEFAULT_SHORTCUTS,
     "showBarIcon": True,
     "showHotkeys": True,
+    "reviewTranslation": False,
     "openaiApiKeyConfigured": False,
     "openaiReasoningEffort": "minimal",
-    "translationContexts": [],
-    "selectedContextId": "",
+    "activeProfileId": "",
     "profiles": [],
 }
 OPENAI_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
@@ -78,7 +81,20 @@ ENGINE_METADATA = {
     "openai": {"name": "OpenAI", "maxChars": 5000, "pairs": []},
 }
 OLLAMA_MODEL = "gemma3"
+# Translation should be faithful and repeatable, so keep sampling close to the top choice.
+OLLAMA_TEMPERATURE = 0.1
 OPENAI_MODEL = "gpt-5-mini"
+# A fidelity audit needs more reasoning than the fast first pass. Keep local
+# jobs local; never silently send an Ollama user's messages to a cloud provider.
+OPENAI_REVIEW_MODEL = "gpt-5"
+OLLAMA_REVIEW_MODEL = OLLAMA_MODEL
+REVIEW_OUTPUT_TOKENS = 16384
+
+
+def review_diagnostic(event, **metadata):
+    """Opt-in developer metadata on stderr only. Never log text, keys or hashes of text."""
+    if os.environ.get("QUICK_TRANSLATE_DEV_DIAGNOSTICS") == "1":
+        print(json.dumps({"component": "quick-translate-review", "event": event, **metadata}), file=sys.stderr, flush=True)
 
 class TranslationError(Exception):
     def __init__(self, code, message): self.code, self.message = code, message
@@ -93,10 +109,10 @@ def default_preferences():
         "shortcuts": dict(DEFAULT_SHORTCUTS),
         "showBarIcon": DEFAULTS["showBarIcon"],
         "showHotkeys": DEFAULTS["showHotkeys"],
+        "reviewTranslation": DEFAULTS["reviewTranslation"],
         "openaiApiKeyConfigured": DEFAULTS["openaiApiKeyConfigured"],
         "openaiReasoningEffort": DEFAULTS["openaiReasoningEffort"],
-        "translationContexts": [],
-        "selectedContextId": "",
+        "activeProfileId": "",
         "profiles": [],
     }
 
@@ -110,7 +126,7 @@ def state_path():
     root = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
     return os.path.join(root, "omarchy", "quick-translate", "preferences.json")
 
-def read_preferences():
+def read_stored_preferences():
     try:
         with open(state_path(), encoding="utf-8") as f:
             raw = json.load(f)
@@ -119,10 +135,13 @@ def read_preferences():
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         return {}
 
-def normalize_translation_contexts(raw):
+def read_preferences():
+    return migrate_contexts_to_profiles(read_stored_preferences())
+
+def legacy_contexts(raw):
     if not isinstance(raw, list): return []
     contexts, ids, names = [], set(), set()
-    for context in raw[:MAX_CONTEXTS]:
+    for context in raw[:LEGACY_MAX_CONTEXTS]:
         if not isinstance(context, dict): continue
         context_id, name, instruction = context.get("id"), context.get("name"), context.get("instruction")
         if (not isinstance(context_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", context_id)
@@ -131,22 +150,66 @@ def normalize_translation_contexts(raw):
         name, instruction = name.strip(), instruction.strip()
         normalized_name = name.casefold()
         if (not name or not instruction or normalized_name in names
-                or len(name) > MAX_CONTEXT_NAME_LENGTH or len(instruction) > MAX_CONTEXT_INSTRUCTION_LENGTH):
+                or len(name) > LEGACY_MAX_CONTEXT_NAME_LENGTH or len(instruction) > MAX_PROFILE_INSTRUCTION_LENGTH):
             continue
         contexts.append({"id": context_id, "name": name, "instruction": instruction})
         ids.add(context_id); names.add(normalized_name)
     return contexts
 
-def translation_context_error(raw):
-    if not isinstance(raw, list) or len(raw) > MAX_CONTEXTS:
-        return "Keep at most %d translation contexts." % MAX_CONTEXTS
-    normalized = normalize_translation_contexts(raw)
-    if len(normalized) != len(raw):
-        return "Each context needs a unique name and instruction."
-    return None
+def unique_profile_name(name, profiles):
+    taken = {str(profile.get("name", "")).strip().casefold() for profile in profiles}
+    candidate, suffix = name, 2
+    while candidate.casefold() in taken:
+        tail = " (%d)" % suffix
+        candidate = name[:MAX_PROFILE_NAME_LENGTH - len(tail)] + tail
+        suffix += 1
+    return candidate
 
-def valid_profile_context_id(value):
-    return value == "" or (isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value))
+def migrate_contexts_to_profiles(raw):
+    """Fold saved translation contexts into profiles; a no-op for migrated preferences."""
+    if "translationContexts" not in raw and "selectedContextId" not in raw:
+        return raw
+    migrated = {key: value for key, value in raw.items() if key not in ("translationContexts", "selectedContextId")}
+    contexts = legacy_contexts(raw.get("translationContexts"))
+    instructions = {context["id"]: context["instruction"] for context in contexts}
+    selected = raw.get("selectedContextId")
+    profiles, used, active = [], set(), ""
+    for profile in raw.get("profiles") if isinstance(raw.get("profiles"), list) else []:
+        if not isinstance(profile, dict): continue
+        context_id = profile.get("selectedContextId", "")
+        upgraded = {key: value for key, value in profile.items() if key != "selectedContextId"}
+        upgraded.setdefault("instruction", instructions.get(context_id, ""))
+        profiles.append(upgraded)
+        if context_id in instructions:
+            used.add(context_id)
+            matches_settings = all(profile.get(key) == raw.get(key) for key in ("translator", "sourceLanguage", "targetLanguage"))
+            if context_id == selected and (not active or matches_settings):
+                active = profile.get("id", "")
+    source = raw.get("sourceLanguage") if raw.get("sourceLanguage") in LANGUAGE_CODES else DEFAULTS["sourceLanguage"]
+    target = raw.get("targetLanguage") if raw.get("targetLanguage") in LANGUAGE_CODES else DEFAULTS["targetLanguage"]
+    translator = raw.get("translator") if raw.get("translator") in ("ollama", "openai") else "ollama"
+    for context in contexts:
+        if context["id"] in used or len(profiles) >= MAX_PROFILES: continue
+        profile_id = "p-" + context["id"][:62]
+        profiles.append({"id": profile_id, "name": unique_profile_name(context["name"], profiles), "translator": translator,
+                         "sourceLanguage": source, "targetLanguage": target, "instruction": context["instruction"]})
+        if context["id"] == selected: active = profile_id
+    migrated["profiles"] = profiles
+    migrated["activeProfileId"] = active
+    return migrated
+
+def backup_legacy_preferences(raw, directory):
+    """Keep the pre-merge data, minus the API key, the first time migrated preferences are saved."""
+    if "translationContexts" not in raw and "selectedContextId" not in raw:
+        return
+    path = os.path.join(directory, "preferences.before-profile-merge.json")
+    if os.path.exists(path):
+        return
+    backup = {key: value for key, value in raw.items() if key != "openaiApiKey"}
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(backup, f, ensure_ascii=False, indent=2)
+        f.write("\n"); f.flush(); os.fsync(f.fileno())
 
 def normalize_profiles(raw):
     if not isinstance(raw, list): return []
@@ -156,11 +219,12 @@ def normalize_profiles(raw):
         profile_id, name = profile.get("id"), profile.get("name")
         translator = profile.get("translator")
         source, target = profile.get("sourceLanguage"), profile.get("targetLanguage")
-        context_id = profile.get("selectedContextId", "")
+        instruction = profile.get("instruction", "")
         if (not isinstance(profile_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", profile_id)
                 or profile_id in ids or not isinstance(name, str) or translator not in ENGINE_METADATA
                 or source not in LANGUAGE_CODES or target not in LANGUAGE_CODES
-                or not valid_profile_context_id(context_id)
+                or not isinstance(instruction, str)
+                or len(instruction.strip()) > MAX_PROFILE_INSTRUCTION_LENGTH
                 or not pair_supported(translator, source, target)):
             continue
         name = name.strip()
@@ -169,13 +233,17 @@ def normalize_profiles(raw):
             continue
         profiles.append({"id": profile_id, "name": name, "translator": translator,
                          "sourceLanguage": source, "targetLanguage": target,
-                         "selectedContextId": context_id})
+                         "instruction": instruction.strip()})
         ids.add(profile_id); names.add(normalized_name)
     return profiles
 
 def profile_error(raw):
     if not isinstance(raw, list) or len(raw) > MAX_PROFILES:
         return "Keep at most %d profiles." % MAX_PROFILES
+    for profile in raw:
+        if isinstance(profile, dict) and isinstance(profile.get("instruction"), str):
+            if len(profile["instruction"].strip()) > MAX_PROFILE_INSTRUCTION_LENGTH:
+                return "Keep profile instructions to at most %s characters." % format(MAX_PROFILE_INSTRUCTION_LENGTH, ",")
     if len(normalize_profiles(raw)) != len(raw):
         return "Each profile needs a unique name and valid translation settings."
     return None
@@ -192,13 +260,12 @@ def preferences_get():
     result["shortcuts"] = normalize_shortcuts(raw.get("shortcuts"))
     if isinstance(raw.get("showBarIcon"), bool): result["showBarIcon"] = raw["showBarIcon"]
     if isinstance(raw.get("showHotkeys"), bool): result["showHotkeys"] = raw["showHotkeys"]
+    if isinstance(raw.get("reviewTranslation"), bool): result["reviewTranslation"] = raw["reviewTranslation"]
     if raw.get("openaiReasoningEffort") in OPENAI_REASONING_EFFORTS:
         result["openaiReasoningEffort"] = raw["openaiReasoningEffort"]
-    result["translationContexts"] = normalize_translation_contexts(raw.get("translationContexts"))
-    available_context_ids = {context["id"] for context in result["translationContexts"]}
-    if raw.get("selectedContextId") in available_context_ids:
-        result["selectedContextId"] = raw["selectedContextId"]
     result["profiles"] = normalize_profiles(raw.get("profiles"))
+    if raw.get("activeProfileId") in {profile["id"] for profile in result["profiles"]}:
+        result["activeProfileId"] = raw["activeProfileId"]
     result["openaiApiKeyConfigured"] = isinstance(raw.get("openaiApiKey"), str) and bool(raw["openaiApiKey"])
     return reply(result)
 
@@ -208,7 +275,6 @@ def shortcut_error(value):
     if value == "Ctrl+Shift+U": return "Ctrl+Shift+U is reserved for Unicode input. Choose another shortcut."
     if value in {"Ctrl+?", "Ctrl+Shift+?", "Ctrl+Shift+/"}: return "Ctrl+? opens Setup. Choose another shortcut."
     if value == "Ctrl+Shift+P": return "Ctrl+Shift+P opens Profiles. Choose another shortcut."
-    if value == "Ctrl+Shift+X": return "Ctrl+Shift+X changes the translation context. Choose another shortcut."
     if value in {"Ctrl+J", "Ctrl+K"}: return "Ctrl+J and Ctrl+K navigate Setup. Choose another shortcut."
     parts = value.split("+")
     modifiers, key = parts[:-1], parts[-1]
@@ -257,9 +323,9 @@ def preferences_set(params):
         "shortcuts": dict(current["shortcuts"]),
         "showBarIcon": params.get("showBarIcon", current["showBarIcon"]),
         "showHotkeys": params.get("showHotkeys", current["showHotkeys"]),
+        "reviewTranslation": params.get("reviewTranslation", current["reviewTranslation"]),
         "openaiReasoningEffort": params.get("openaiReasoningEffort", current["openaiReasoningEffort"]),
-        "translationContexts": params.get("translationContexts", current["translationContexts"]),
-        "selectedContextId": params.get("selectedContextId", current["selectedContextId"]),
+        "activeProfileId": params.get("activeProfileId", current["activeProfileId"]),
         "profiles": params.get("profiles", current["profiles"]),
         "openaiApiKey": openai_api_key,
     }
@@ -277,19 +343,19 @@ def preferences_set(params):
         return fail("invalid_preference", "Choose whether to show the menu bar icon.")
     if not isinstance(value["showHotkeys"], bool):
         return fail("invalid_preference", "Choose whether to show shortcut hints.")
+    if not isinstance(value["reviewTranslation"], bool):
+        return fail("invalid_preference", "Choose whether to review AI translations.")
     if value["openaiReasoningEffort"] not in OPENAI_REASONING_EFFORTS:
         return fail("invalid_preference", "Choose a valid OpenAI reasoning effort.")
-    context_error = translation_context_error(value["translationContexts"])
-    if context_error:
-        return fail("invalid_context", context_error)
     profiles_error = profile_error(value["profiles"])
     if profiles_error:
         return fail("invalid_profile", profiles_error)
-    if not isinstance(value["selectedContextId"], str):
-        return fail("invalid_context", "Choose a valid translation context.")
-    context_ids = {context["id"] for context in value["translationContexts"]}
-    if value["selectedContextId"] not in context_ids and value["selectedContextId"] != "":
-        return fail("invalid_context", "Choose a valid translation context.")
+    value["profiles"] = normalize_profiles(value["profiles"])
+    profile_ids = {profile["id"] for profile in value["profiles"]}
+    if "profiles" in params and "activeProfileId" not in params and value["activeProfileId"] not in profile_ids:
+        value["activeProfileId"] = ""
+    if not isinstance(value["activeProfileId"], str) or (value["activeProfileId"] and value["activeProfileId"] not in profile_ids):
+        return fail("invalid_profile", "Choose a saved profile.")
     if not isinstance(value["openaiApiKey"], str) or len(value["openaiApiKey"]) > 512:
         return fail("invalid_api_key", "Enter a valid OpenAI API key.")
     shortcut_message = None
@@ -306,6 +372,7 @@ def preferences_set(params):
     path = state_path(); directory = os.path.dirname(path)
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+        backup_legacy_preferences(read_stored_preferences(), directory)
         fd, temporary = tempfile.mkstemp(prefix=".preferences-", dir=directory)
         try:
             os.fchmod(fd, 0o600)
@@ -358,22 +425,49 @@ def read_json(response):
     try: return json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError): raise ValueError("malformed response")
 
-def translation_instruction(source, target):
-    return ("Translate the user's text from %s to %s. Preserve meaning, tone, line breaks, and formatting. "
-            "Reply with only the translation—no explanation, label, quotation marks, or Markdown fence."
-            % (LANGUAGE_NAMES[source], LANGUAGE_NAMES[target]))
-
-def selected_translation_context(preferences):
-    selected_id = preferences.get("selectedContextId")
-    for context in normalize_translation_contexts(preferences.get("translationContexts")):
-        if context["id"] == selected_id: return context["instruction"]
+def active_profile_instruction(preferences):
+    active_id = preferences.get("activeProfileId")
+    for profile in normalize_profiles(preferences.get("profiles")):
+        if profile["id"] == active_id: return profile["instruction"]
     return ""
 
-def translation_instruction_with_context(source, target, context):
-    instruction = translation_instruction(source, target)
-    if context:
-        instruction += "\n\nAdditional translation context:\n" + context
-    return instruction
+def provider_messages(text, source, target, context, instructions, instruction_role):
+    """A review pass brings its own instructions; every other request uses the shared layers."""
+    if instructions:
+        return [{"role": instruction_role, "content": instructions}, {"role": "user", "content": text}]
+    return translation_messages(LANGUAGE_NAMES[source], LANGUAGE_NAMES[target], context, text, instruction_role)
+
+def request_preferences(params):
+    """Freeze provider configuration and context for both passes of this job."""
+    preferences = read_preferences()
+    preferences["requestContext"] = params.get("customContext", active_profile_instruction(preferences))
+    if "openaiReasoningEffort" in params:
+        preferences["openaiReasoningEffort"] = params["openaiReasoningEffort"]
+    return preferences
+
+def review_message(text, draft, source, target, context):
+    """Plain-text review request with the FULL original, draft and context, unmodified."""
+    def bullets(rows): return "\n".join("- " + row for row in rows) if rows else "None"
+    terminology = ["%s → %s" % pair for pair in required_terminology(text, source, target).items()]
+    findings = [note for _, note in translation_findings(text, draft, source, target)]
+    return ("Source language: %s (%s)\nTarget language: %s (%s)\n\n"
+            "Custom translation instructions:\n<custom_instructions>\n%s\n</custom_instructions>\n\n"
+            "Required terminology (source term → required %s term):\n%s\n\n"
+            "Protected text (copy exactly):\n%s\n\n"
+            "Automatic checks found these problems in the draft:\n%s\n\n"
+            "<original>\n%s\n</original>\n\n<draft>\n%s\n</draft>\n\n"
+            "Reply with exactly %s if the draft has no missing information, changed meaning, invented details "
+            "or incorrect terminology. Otherwise reply with only the complete corrected %s translation."
+            % (LANGUAGE_NAMES[source], source, LANGUAGE_NAMES[target], target, context or "None",
+               LANGUAGE_NAMES[target], bullets(terminology), bullets(protected_literals(text)), bullets(findings),
+               text, draft, UNCHANGED, LANGUAGE_NAMES[target]))
+
+def review_sections(message):
+    """Extract the embedded texts; used to verify requests without logging them."""
+    def section(name):
+        match = re.search(r"<%s>\n(.*)\n</%s>" % (name, name), message, re.S)
+        return match.group(1) if match else None
+    return {"original": section("original"), "draft": section("draft"), "context": section("custom_instructions")}
 
 def translate_google(text, source, target):
     query = urllib.parse.urlencode({"client":"gtx", "sl":source, "tl":target, "dt":"t"})
@@ -430,35 +524,93 @@ def translate_reverso(text, source, target):
     if not isinstance(translated, str) or not translated: raise ValueError("empty translation")
     return translated
 
-def translate_ollama(text, source, target):
-    preferences = read_preferences()
-    context = selected_translation_context(preferences)
-    body = json.dumps({"model": OLLAMA_MODEL, "stream": False,
-                       "messages": [{"role": "system", "content": translation_instruction_with_context(source, target, context)},
-                                    {"role": "user", "content": text}]}).encode("utf-8")
+def translate_ollama(text, source, target, progress=None, preferences=None, instructions=None):
+    preferences = read_preferences() if preferences is None else preferences
+    context = preferences.get("requestContext", active_profile_instruction(preferences))
+    body = {"model": OLLAMA_MODEL, "stream": progress is not None, "options": {"num_ctx": 16384, "temperature": OLLAMA_TEMPERATURE},
+            "messages": provider_messages(text, source, target, context, instructions, "system")}
+    if preferences.get("reviewTranslation") is True or instructions is not None:
+        body.update({"truncate": False, "shift": False})
+    if instructions is not None:
+        body["model"] = OLLAMA_REVIEW_MODEL
+        body["options"].update({"num_predict": REVIEW_OUTPUT_TOKENS,
+                                "num_ctx": 32768})
+        # Ollama applies its model tokenizer and chat template to check capacity.
+        # UTF-8 bytes and JSON-schema size are not a token count. Keep truncation
+        # disabled and let the engine reject actual overflow without slicing text.
+    body = json.dumps(body).encode("utf-8")
     request = urllib.request.Request("http://localhost:11434/api/chat", data=body,
                                      headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = read_json(response)
-    translated = payload.get("message", {}).get("content")
+    with urllib.request.urlopen(request, timeout=300) as response:
+        if progress is None:
+            payload = read_json(response)
+            if instructions is not None:
+                review_diagnostic("provider_response", provider="ollama", model=payload.get("model") if isinstance(payload, dict) else None,
+                    prompt_tokens=payload.get("prompt_eval_count") if isinstance(payload, dict) else None,
+                    output_tokens=payload.get("eval_count") if isinstance(payload, dict) else None)
+            if not isinstance(payload, dict) or payload.get("error") or payload.get("done") is False:
+                raise ValueError("invalid translation response")
+            if instructions is not None and payload.get("done") is not True:
+                raise ValueError("incomplete review response")
+            if payload.get("done_reason") == "length":
+                raise TranslationError("incomplete_translation", "Ollama reached its output limit. Try translating a smaller section.")
+            message = payload.get("message", {})
+            if not isinstance(message, dict): raise ValueError("invalid translation message")
+            translated = message.get("content")
+        else:
+            parts, received, finished = [], 0, False
+            while True:
+                line = response.readline(MAX_RESPONSE_BYTES - received + 1)
+                if not line: break
+                received += len(line)
+                if received > MAX_RESPONSE_BYTES: raise ValueError("response too large")
+                if not line.strip(): continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict) or payload.get("error"):
+                    raise ValueError("invalid translation stream")
+                message = payload.get("message", {})
+                if not isinstance(message, dict): raise ValueError("invalid translation message")
+                chunk = message.get("content", "")
+                if not isinstance(chunk, str): raise ValueError("invalid translation chunk")
+                if chunk:
+                    parts.append(chunk)
+                    progress({"event": "progress", "delta": chunk})
+                if payload.get("done") is True:
+                    if instructions is not None:
+                        review_diagnostic("provider_response", provider="ollama", model=payload.get("model"),
+                            prompt_tokens=payload.get("prompt_eval_count"), output_tokens=payload.get("eval_count"))
+                    if payload.get("done_reason") == "length":
+                        raise TranslationError("incomplete_translation", "Ollama reached its output limit. Try translating a smaller section.")
+                    finished = True
+                    break
+            if not finished: raise ValueError("incomplete translation stream")
+            translated = "".join(parts)
     if not isinstance(translated, str) or not translated.strip(): raise ValueError("empty translation")
     return translated
 
-def translate_openai(text, source, target):
-    preferences = read_preferences()
+def translate_openai(text, source, target, preferences=None, instructions=None):
+    preferences = read_preferences() if preferences is None else preferences
     api_key = preferences.get("openaiApiKey")
     if not isinstance(api_key, str) or not api_key:
         raise TranslationError("openai_api_key_missing", "Add your OpenAI API key in Setup before using OpenAI.")
     reasoning_effort = preferences.get("openaiReasoningEffort")
     if reasoning_effort not in OPENAI_REASONING_EFFORTS: reasoning_effort = DEFAULTS["openaiReasoningEffort"]
-    context = selected_translation_context(preferences)
-    body = json.dumps({"model": OPENAI_MODEL, "reasoning": {"effort": reasoning_effort},
-                       "input": [{"role": "developer", "content": translation_instruction_with_context(source, target, context)},
-                                 {"role": "user", "content": text}]}).encode("utf-8")
+    context = preferences.get("requestContext", active_profile_instruction(preferences))
+    body = {"model": OPENAI_MODEL, "reasoning": {"effort": reasoning_effort}, "truncation": "disabled",
+            "input": provider_messages(text, source, target, context, instructions, "developer")}
+    if instructions is not None:
+        body.update({"model": OPENAI_REVIEW_MODEL, "reasoning": {"effort": "medium"},
+                     "max_output_tokens": REVIEW_OUTPUT_TOKENS, "store": False})
+    body = json.dumps(body).encode("utf-8")
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=body,
                                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=300 if instructions is not None else 60) as response:
         payload = read_json(response)
+    if not isinstance(payload, dict): raise ValueError("invalid translation response")
+    if instructions is not None:
+        review_diagnostic("provider_response", provider="openai", model=payload.get("model"))
+    if payload.get("status", None if instructions is not None else "completed") != "completed" or payload.get("error"):
+        raise TranslationError("incomplete_translation", "OpenAI returned an incomplete translation. Try translating a smaller section.")
     translated = openai_output_text(payload)
     if not isinstance(translated, str) or not translated.strip(): raise ValueError("empty translation")
     return translated
@@ -496,7 +648,23 @@ def openai_error_code(error):
     except (OSError, UnicodeDecodeError, ValueError, AttributeError):
         return ""
 
-def translate(params):
+def ollama_context_error(error):
+    """Recognize the engine's structured overflow code without exposing its body."""
+    try:
+        with error:
+            value = read_json(error)
+        for _ in range(4):
+            if isinstance(value, str): value = json.loads(value)
+            if not isinstance(value, dict): return False
+            if value.get("type") == "exceed_context_size_error" or value.get("code") == "context_length_exceeded":
+                return True
+            value = value.get("error")
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+
+def translate_once(params, progress=None, preferences=None, review=False):
     text = params.get("text")
     source = params.get("sourceLanguage")
     target = params.get("targetLanguage")
@@ -507,17 +675,66 @@ def translate(params):
     if len(text) > max_chars: return fail("input_too_long", "%s accepts %s characters or fewer." % (ENGINE_METADATA[translator]["name"], f"{max_chars:,}"))
     if source not in LANGUAGE_CODES or target not in LANGUAGE_CODES: return fail("invalid_language", "Choose a language from the catalogue.")
     if not pair_supported(translator, source, target): return fail("unsupported_language_pair", "That translator does not support the selected language pair.")
-    if source == target: return reply({"translation": text})
+    if source == target and not review: return reply({"translation": text})
+    # Trailing whitespace makes small local models drop words from short input.
+    text = text.strip()
+    preferences = request_preferences(params) if preferences is None else preferences
+    context = preferences.get("requestContext", "")
+    if not isinstance(context, str) or len(context) > MAX_PROFILE_INSTRUCTION_LENGTH:
+        return fail("invalid_context", "Keep profile instructions to at most 11,000 characters.")
     try:
         translators = {"google": translate_google, "apertium": translate_apertium,
                        "bing": translate_bing, "reverso": translate_reverso,
                        "ollama": translate_ollama, "openai": translate_openai}
-        return reply({"translation": translators[translator](text, source, target)})
+        instructions = None
+        if review:
+            if translator not in {"ollama", "openai"}:
+                return fail("invalid_translator", "Translation review requires Ollama or OpenAI.")
+            draft = params.get("draft")
+            if not isinstance(draft, str) or not draft.strip():
+                return fail("invalid_draft", "Keep the complete draft to retry its review.")
+            instructions = Path(__file__).with_name("review_prompt.txt").read_text(encoding="utf-8").strip()
+            if not instructions:
+                raise TranslationError("review_prompt", "The translation review prompt is empty.")
+            text = review_message(text, draft, source, target, context)
+            sections = review_sections(text)
+            review_diagnostic("request", provider=translator,
+                model=OLLAMA_REVIEW_MODEL if translator == "ollama" else OPENAI_REVIEW_MODEL,
+                source_language=source, target_language=target,
+                source_characters=len(params["text"]), draft_characters=len(draft), context_characters=len(context),
+                input_characters=len(text), source_matches=sections["original"] == params["text"],
+                draft_matches=sections["draft"] == draft, context_matches=sections["context"] == (context or "None"),
+                draft_check_failures=len(translation_findings(params["text"], draft, source, target)),
+                instruction_file="review_prompt.txt", instruction_sha256=hashlib.sha256(instructions.encode()).hexdigest(),
+                instruction_characters=len(instructions), output_token_budget=REVIEW_OUTPUT_TOKENS,
+                reasoning_effort="medium" if translator == "openai" else None,
+                input_truncation=False, local_context_tokens=32768 if translator == "ollama" else None)
+        if translator not in {"ollama", "openai"}:
+            return reply({"translation": translators[translator](text, source, target)})
+        if translator == "ollama":
+            output = translate_ollama(text, source, target, progress, preferences, instructions)
+        else:
+            output = translate_openai(text, source, target, preferences, instructions)
+        if not review: return reply({"translation": output})
+        # One review request. Any invalid, ambiguous or failing result is a
+        # visible failure; it is never patched, retried silently, or shown.
+        try:
+            output, changed = interpret_review(output, params["text"], draft, source, target)
+        except ValueError as exc:
+            review_diagnostic("rejected", reason=str(exc))
+            message = "The reviewer's answer failed validation (%s). The result has not been accepted." % str(exc)
+            raise TranslationError("invalid_review", message) from None
+        review_diagnostic("accepted", output_characters=len(output), changed=changed)
+        return reply({"translation": output, "reviewChanged": changed})
     except TranslationError as exc:
         return fail(exc.code, exc.message)
     except urllib.error.HTTPError as exc:
         name = ENGINE_METADATA[translator]["name"]
+        if translator == "ollama" and exc.code in {400, 413} and ollama_context_error(exc):
+            return fail("review_context_limit" if review else "context_limit", "The local model reported that the complete input exceeds its context window. No input was truncated.")
         if translator == "ollama" and exc.code == 404:
+            if review:
+                return fail("ollama_model_missing", "The local review model is not installed. Run: ollama pull " + OLLAMA_REVIEW_MODEL + ". Review has not completed.")
             return fail("ollama_model_missing", "Ollama is running, but Gemma 3 is not installed. Run: ollama pull gemma3")
         if translator == "openai" and exc.code in {401, 403}:
             return fail("openai_auth", "OpenAI rejected the API key. Update it in Setup.")
@@ -533,6 +750,53 @@ def translate(params):
         return fail("offline", "Could not reach %s. Check your connection." % ENGINE_METADATA[translator]["name"])
     except TimeoutError: return fail("timeout", "The translation request timed out.")
     except (UnicodeDecodeError, ValueError, KeyError, IndexError, TypeError): return fail("malformed_response", "%s returned an unexpected response." % ENGINE_METADATA[translator]["name"])
+    except OSError: return fail("provider_error", "Could not complete the AI request. Check the service and review prompt file.")
+
+def review_progress(progress):
+    """Report activity without exposing draft or unfinished reviewed text to the result box."""
+    if progress is None: return None
+    characters = 0
+    def report(event):
+        nonlocal characters
+        if event.get("event") == "stage":
+            characters = 0
+            progress(event)
+            return
+        characters += len(event.get("delta", ""))
+        progress({"event": "progress", "characters": characters})
+    return report
+
+def review_translation(params, progress=None, preferences=None):
+    preferences = request_preferences(params) if preferences is None else preferences
+    if progress: progress({"event": "stage", "stage": "reviewing"})
+    result = translate_once(params, review_progress(progress), preferences, review=True)
+    if not result["ok"]: review_diagnostic("failed", code=result["error"]["code"])
+    if result["ok"]:
+        result["data"]["reviewed"] = True
+        return result
+    failed = fail("review_failed", "Translation succeeded, but review failed: " + result["error"]["message"] + " Retry review without translating again.")
+    failed["error"]["cause"] = result["error"]["code"]
+    # In-memory retry data only. Never include provider keys or save source/draft to disk.
+    failed["reviewRequest"] = {key: params[key] for key in (
+        "text", "draft", "translator", "sourceLanguage", "targetLanguage", "customContext",
+        "selectedContextId", "openaiReasoningEffort", "reviewTranslation") if key in params}
+    return failed
+
+def translate(params, progress=None):
+    preferences = request_preferences(params)
+    enabled = params.get("reviewTranslation", preferences.get("reviewTranslation") is True)
+    if not isinstance(enabled, bool): return fail("invalid_preference", "Choose whether to review AI translations.")
+    preferences["reviewTranslation"] = enabled
+    if not enabled or params.get("translator", "google") not in {"ollama", "openai"} or params.get("sourceLanguage") == params.get("targetLanguage"):
+        return translate_once(params, progress, preferences)
+    draft_result = translate_once(params, review_progress(progress), preferences)
+    if not draft_result["ok"]: return draft_result
+    draft = draft_result["data"]["translation"]
+    review_request = dict(params, draft=draft, customContext=preferences["requestContext"], reviewTranslation=True,
+                          selectedContextId=params.get("selectedContextId", preferences.get("selectedContextId", "")),
+                          openaiReasoningEffort=preferences.get("openaiReasoningEffort", DEFAULTS["openaiReasoningEffort"]))
+    if progress: progress({"event": "draft", "draft": draft})
+    return review_translation(review_request, progress, preferences)
 
 def copy_text(params):
     text = params.get("text")
@@ -550,7 +814,7 @@ def copy_text(params):
     except (OSError, subprocess.SubprocessError):
         return fail("clipboard", "Could not copy to the clipboard.")
 
-def handle(request):
+def handle(request, progress=None):
     if not isinstance(request, dict): return fail("invalid_request", "Request must be an object.")
     operation = request.get("operation"); params = request.get("params", {})
     if not isinstance(params, dict): return fail("invalid_request", "Request parameters must be an object.")
@@ -558,13 +822,16 @@ def handle(request):
     if operation == "preferences.set": return preferences_set(params)
     if operation == "preferences.resetShortcuts": return preferences_set({"shortcuts": DEFAULT_SHORTCUTS})
     if operation == "engines.get": return engine_data()
-    if operation == "translate": return translate(params)
+    if operation == "translate": return translate(params, progress)
+    if operation == "review": return review_translation(params, progress)
     if operation == "copy": return copy_text(params)
     return fail("unknown_operation", "Unknown operation.")
 
 def main():
     line = sys.stdin.readline()
-    try: response = handle(json.loads(line))
+    def emit_progress(event):
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    try: response = handle(json.loads(line), progress=emit_progress)
     except json.JSONDecodeError: response = fail("invalid_json", "Request was not valid JSON.")
     print(json.dumps(response, ensure_ascii=False), flush=True)
 
