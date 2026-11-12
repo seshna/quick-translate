@@ -38,10 +38,10 @@ Disable and remove the plugin with:
 
 ## Features
 
-- Google (default), Apertium, Bing, Reverso, Ollama Local, and OpenAI translators
+- Google (default), Apertium, Bing, Reverso, Ollama Local, OpenAI, and Claude translators
 - Searchable, engine-aware From and To language selectors
 - Named profiles for a translator, language pair, and optional instructions, grouped by language pair and editable from the profile picker
-- Profile instructions up to 11,000 characters for Ollama and OpenAI, with a live counter
+- Profile instructions up to 11,000 characters for Ollama, OpenAI, and Claude, with a live counter
 - Ollama requests a 16,384-token context window for instructions, source text, and output
 - Single-pass Ollama translations stream into the result box, with elapsed time and a generated-character count
 - Optional Review Translation setting, off by default, adds a focused second AI accuracy check before showing the final result
@@ -55,7 +55,7 @@ Disable and remove the plugin with:
 - Optional shortcut hints on the main page, `Ctrl+?` to open Setup, and `Ctrl+Shift+P` for profiles
 - Up to 5,000 input characters.
 
-## How Ollama and OpenAI requests are built
+## How Ollama, OpenAI, and Claude requests are built
 
 Every model request has three separate layers, defined in `translation_prompt.py`:
 
@@ -71,12 +71,12 @@ Google, Apertium, Bing, and Reverso take no prompt and receive only the text.
 
 ## Optional AI review
 
-Enable **Review Translation** in Setup to check translations from Ollama or OpenAI.
+Enable **Review Translation** in Setup to check translations from Ollama, OpenAI, or Claude.
 After the normal translation, a separate second AI request receives the FULL
 original, the FULL draft, the source and target languages, and the same custom
 context used for the first pass. Local review uses the same `gemma3` model as the
 draft; local text is never sent to OpenAI. OpenAI review uses `gpt-5` with medium
-reasoning. Other translators keep their existing behaviour.
+reasoning. Claude review uses Sonnet. Other translators keep their existing behaviour.
 
 The reviewer (`review_prompt.txt`) checks only for:
 
@@ -198,7 +198,10 @@ Translation requests use public, no-key web endpoints for Google, Apertium,
 Bing, and Reverso. These are not supported commercial APIs; they may change,
 rate-limit, or become unavailable without notice. Ollama Local sends requests
 to your local Ollama service; install the `gemma3` model with `ollama pull gemma3`.
-OpenAI sends requests to OpenAI and requires an API key entered in Setup. Entered
+OpenAI sends requests to OpenAI and requires an API key entered in Setup. Claude
+runs the Claude Code CLI (`claude --print`, Haiku for translation) with your existing
+Claude Code sign-in, so it needs no API key; tools, MCP servers, settings, and hooks
+are turned off for these requests, and usage counts toward your Claude plan. Entered
 text is sent to the selected provider, so do not use this plugin for sensitive content.
 
 The selected translator and language pair, saved profiles and the active profile,
@@ -216,6 +219,7 @@ is saved. Source and translated text are never written to disk by the plugin.
 - Omarchy / Omarchy Shell with third-party plugin support
 - Python 3 (standard library only)
 - wl-copy from wl-clipboard for clipboard actions
+- Claude Code, signed in, for the Claude translator (`omarchy install ai claude`)
 - Internet access for translation
 
 ## Development

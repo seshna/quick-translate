@@ -251,10 +251,11 @@ Item {
   function activeTranslatorLabel() {
     if (translator === "ollama") return "Ollama Local · Gemma 3"
     if (translator === "openai") return "OpenAI · GPT-5 mini"
+    if (translator === "claude") return "Claude · Haiku"
     var engine = engineFor(translator)
     return engine ? engine.name : "Google"
   }
-  function usesLlm() { return translator === "ollama" || translator === "openai" }
+  function usesLlm() { return translatorUsesLlm(translator) }
   function newProfileId() { return "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
   function profileForId(id) {
     for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return profiles[i]
@@ -288,13 +289,14 @@ Item {
     if (!profile) return "No profile"
     return profile.name.length > 28 ? profile.name.slice(0, 27) + "…" : profile.name
   }
-  function translatorUsesLlm(id) { return id === "ollama" || id === "openai" }
+  function translatorUsesLlm(id) { return id === "ollama" || id === "openai" || id === "claude" }
   function reasoningEffortLabel(value) { return value.charAt(0).toUpperCase() + value.slice(1) }
   function openaiReasoningEffortIndex() { return openaiReasoningEfforts.indexOf(openaiReasoningEffort) }
   function translatorOptions() {
     var groups = [
       {title: "No key / public web", ids: ["google", "apertium", "bing", "reverso"]},
       {title: "Local model", ids: ["ollama"]},
+      {title: "Claude Code sign-in", ids: ["claude"]},
       {title: "API key required", ids: ["openai"]}
     ]
     var options = []
@@ -366,7 +368,7 @@ Item {
       translationPreview = ""
       translationStage = operation === "review" ? "reviewing" : "translating"
       translationReviewEnabled = operation === "review" || (params.reviewTranslation === true
-        && (params.translator === "ollama" || params.translator === "openai") && params.sourceLanguage !== params.targetLanguage)
+        && translatorUsesLlm(params.translator) && params.sourceLanguage !== params.targetLanguage)
       translationGeneratedCharacters = 0
       if (translationReviewEnabled) translatedText = ""
       translationStartedAt = Date.now()

@@ -79,7 +79,10 @@ ENGINE_METADATA = {
     "reverso": {"name": "Reverso", "maxChars": 2000, "pairs": REVERSO_PAIRS},
     "ollama": {"name": "Ollama Local", "maxChars": 5000, "pairs": []},
     "openai": {"name": "OpenAI", "maxChars": 5000, "pairs": []},
+    "claude": {"name": "Claude", "maxChars": 5000, "pairs": []},
 }
+# Engines that send the shared translation prompt to a language model.
+LLM_TRANSLATORS = {"ollama", "openai", "claude"}
 OLLAMA_MODEL = "gemma3"
 # Translation should be faithful and repeatable, so keep sampling close to the top choice.
 OLLAMA_TEMPERATURE = 0.1
@@ -89,6 +92,10 @@ OPENAI_MODEL = "gpt-5-mini"
 OPENAI_REVIEW_MODEL = "gpt-5"
 OLLAMA_REVIEW_MODEL = OLLAMA_MODEL
 REVIEW_OUTPUT_TOKENS = 16384
+# Claude runs through the Claude Code CLI with the user's own sign-in, so it
+# needs no API key. Haiku keeps the first pass fast; review uses Sonnet.
+CLAUDE_MODEL = "haiku"
+CLAUDE_REVIEW_MODEL = "sonnet"
 
 
 def review_diagnostic(event, **metadata):
@@ -615,6 +622,50 @@ def translate_openai(text, source, target, preferences=None, instructions=None):
     if not isinstance(translated, str) or not translated.strip(): raise ValueError("empty translation")
     return translated
 
+def claude_command():
+    """The Claude Code CLI. The shell's PATH may not include mise's wrappers."""
+    import shutil
+    found = shutil.which("claude")
+    if found: return found
+    home = Path.home()
+    for candidate in (home / ".local/share/mise/command-wrappers/bin/claude", home / ".local/bin/claude",
+                      home / ".claude/local/claude"):
+        if os.access(candidate, os.X_OK): return str(candidate)
+    raise TranslationError("claude_missing", "Claude Code is not installed. Run: omarchy install ai claude")
+
+def translate_claude(text, source, target, preferences=None, instructions=None):
+    preferences = read_preferences() if preferences is None else preferences
+    context = preferences.get("requestContext", active_profile_instruction(preferences))
+    messages = provider_messages(text, source, target, context, instructions, "system")
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    prompt = "\n\n".join(m["content"] for m in messages if m["role"] == "user")
+    # No tools, MCP servers, slash commands, settings (so no hooks) or saved
+    # session: a single plain completion. Run from an empty directory so no
+    # project files are picked up.
+    command = [claude_command(), "--print", "--output-format", "text",
+               "--model", CLAUDE_REVIEW_MODEL if instructions is not None else CLAUDE_MODEL,
+               "--system-prompt", system, "--tools", "", "--strict-mcp-config",
+               "--disable-slash-commands", "--setting-sources", "", "--no-session-persistence"]
+    with tempfile.TemporaryDirectory(prefix="quick-translate-") as workdir:
+        try:
+            result = subprocess.run(command, input=prompt, capture_output=True, text=True, cwd=workdir,
+                                    timeout=300 if instructions is not None else 90)
+        except subprocess.TimeoutExpired:
+            raise TranslationError("timeout", "Claude did not answer in time. Try again.") from None
+    if instructions is not None:
+        review_diagnostic("provider_response", provider="claude", model=CLAUDE_REVIEW_MODEL)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        detail = detail[-1][:200] if detail else "exit code %d" % result.returncode
+        if re.search(r"log ?in|auth|credential", detail, re.I):
+            raise TranslationError("claude_auth", "Claude Code is not signed in. Run claude in a terminal and log in.")
+        if re.search(r"rate|limit|quota|overloaded", detail, re.I):
+            raise TranslationError("claude_rate_limited", "Claude is busy or your usage limit was reached: " + detail)
+        raise TranslationError("claude_failed", "Claude failed: " + detail)
+    translated = result.stdout.strip()
+    if not translated: raise ValueError("empty translation")
+    return translated
+
 def openai_output_text(payload):
     """Extract text from the raw Responses API output array.
 
@@ -688,8 +739,8 @@ def translate_once(params, progress=None, preferences=None, review=False):
                        "ollama": translate_ollama, "openai": translate_openai}
         instructions = None
         if review:
-            if translator not in {"ollama", "openai"}:
-                return fail("invalid_translator", "Translation review requires Ollama or OpenAI.")
+            if translator not in LLM_TRANSLATORS:
+                return fail("invalid_translator", "Translation review requires Ollama, OpenAI or Claude.")
             draft = params.get("draft")
             if not isinstance(draft, str) or not draft.strip():
                 return fail("invalid_draft", "Keep the complete draft to retry its review.")
@@ -699,7 +750,7 @@ def translate_once(params, progress=None, preferences=None, review=False):
             text = review_message(text, draft, source, target, context)
             sections = review_sections(text)
             review_diagnostic("request", provider=translator,
-                model=OLLAMA_REVIEW_MODEL if translator == "ollama" else OPENAI_REVIEW_MODEL,
+                model={"ollama": OLLAMA_REVIEW_MODEL, "claude": CLAUDE_REVIEW_MODEL}.get(translator, OPENAI_REVIEW_MODEL),
                 source_language=source, target_language=target,
                 source_characters=len(params["text"]), draft_characters=len(draft), context_characters=len(context),
                 input_characters=len(text), source_matches=sections["original"] == params["text"],
@@ -709,10 +760,12 @@ def translate_once(params, progress=None, preferences=None, review=False):
                 instruction_characters=len(instructions), output_token_budget=REVIEW_OUTPUT_TOKENS,
                 reasoning_effort="medium" if translator == "openai" else None,
                 input_truncation=False, local_context_tokens=32768 if translator == "ollama" else None)
-        if translator not in {"ollama", "openai"}:
+        if translator not in LLM_TRANSLATORS:
             return reply({"translation": translators[translator](text, source, target)})
         if translator == "ollama":
             output = translate_ollama(text, source, target, progress, preferences, instructions)
+        elif translator == "claude":
+            output = translate_claude(text, source, target, preferences, instructions)
         else:
             output = translate_openai(text, source, target, preferences, instructions)
         if not review: return reply({"translation": output})
@@ -787,7 +840,7 @@ def translate(params, progress=None):
     enabled = params.get("reviewTranslation", preferences.get("reviewTranslation") is True)
     if not isinstance(enabled, bool): return fail("invalid_preference", "Choose whether to review AI translations.")
     preferences["reviewTranslation"] = enabled
-    if not enabled or params.get("translator", "google") not in {"ollama", "openai"} or params.get("sourceLanguage") == params.get("targetLanguage"):
+    if not enabled or params.get("translator", "google") not in LLM_TRANSLATORS or params.get("sourceLanguage") == params.get("targetLanguage"):
         return translate_once(params, progress, preferences)
     draft_result = translate_once(params, review_progress(progress), preferences)
     if not draft_result["ok"]: return draft_result
