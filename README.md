@@ -47,6 +47,7 @@ Disable and remove the plugin with:
 - Optional Review Translation setting, off by default, adds a focused second AI accuracy check before showing the final result
 - Press the Translate shortcut again, normally Ctrl+Enter, or click Cancel to stop either stage
 - Multiline input and read-only translated output
+- Text selected anywhere on screen fills the input and is translated as soon as the overlay opens
 - English → Japanese by default; selected languages save immediately
 - Copy translation, or copy source and translation together
 - Clear both text boxes and undo the clear
@@ -218,7 +219,7 @@ is saved. Source and translated text are never written to disk by the plugin.
 
 - Omarchy / Omarchy Shell with third-party plugin support
 - Python 3 (standard library only)
-- wl-copy from wl-clipboard for clipboard actions
+- wl-copy and wl-paste from wl-clipboard for clipboard actions and reading the selected text
 - Claude Code, signed in, for the Claude translator (`omarchy install ai claude`)
 - Internet access for translation
 

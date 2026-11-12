@@ -28,6 +28,10 @@ Item {
       + (translationStage === "reviewing" ? " review characters generated" : " characters generated")
       : " · Waiting for the first text…")
   property var pendingOperations: []
+  // Selected text picked up when the overlay opens
+  property string lastSelection: ""
+  property bool autoTranslatePending: false
+  onBusyChanged: if (!busy && autoTranslatePending) { autoTranslatePending = false; translate() }
   property string copiedAction: ""
   property string sourceLanguage: "en"
   property string targetLanguage: "ja"
@@ -922,6 +926,21 @@ Item {
     resetConfirmationVisible = false
     opened = true
     focusMainSelection()
+    if (!selectionReader.running) selectionReader.running = true
+  }
+  // Fill the source box with the primary selection and translate it. A
+  // selection that was already used is skipped, so reopening the overlay
+  // doesn't overwrite edits or retranslate stale text.
+  function useSelection(text) {
+    if (!opened || translating || setupOpen || profilesOpen) return
+    if (text.trim().length === 0 || text === lastSelection || text.length > maxChars) return
+    lastSelection = text
+    sourceBox.text = text
+    translatedText = ""
+    message = ""
+    messageError = false
+    if (canTranslate) translate()
+    else autoTranslatePending = true
   }
   function close() { opened = false }
   function dismiss() { opened = false; if (shell) shell.hide((manifest && manifest.id) || "shaun.quick-translate") }
@@ -966,6 +985,16 @@ Item {
     interval: root.translationStage === "reviewing" ? 900000 : 300000
     running: root.translating && bridge.translationRequest !== null && bridge.translationRequest.translator === "ollama"
     onTriggered: root.stopTranslation("timeout")
+  }
+
+  Process {
+    id: selectionReader
+    command: ["wl-paste", "--primary", "--no-newline", "--type", "text"]
+    // Empty output (no selection, or wl-paste failed) is ignored
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.useSelection(text)
+    }
   }
 
   Process {
