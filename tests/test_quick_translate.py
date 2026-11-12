@@ -152,7 +152,7 @@ class QuickTranslateTests(unittest.TestCase):
     self.assertEqual(qt.translate({"text":"x", "translator":"apertium", "sourceLanguage":"en", "targetLanguage":"ja"})["error"]["code"], "unsupported_language_pair")
   def test_engine_catalogue_and_public_adapter_parsers(self):
     engines = {entry["id"]: entry for entry in qt.engine_data()["data"]}
-    self.assertEqual(list(engines), ["google", "apertium", "bing", "reverso", "ollama", "openai"])
+    self.assertEqual(list(engines), ["google", "apertium", "bing", "reverso", "ollama", "openai", "claude"])
     self.assertEqual(engines["bing"]["maxChars"], 1000)
     self.assertIn(("en", "es"), [tuple(pair) for pair in engines["apertium"]["pairs"]])
     self.assertTrue(qt.pair_supported("reverso", "en", "ja"))

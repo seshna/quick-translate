@@ -28,6 +28,10 @@ Item {
       + (translationStage === "reviewing" ? " review characters generated" : " characters generated")
       : " · Waiting for the first text…")
   property var pendingOperations: []
+  // Selected text picked up when the overlay opens
+  property string lastSelection: ""
+  property bool autoTranslatePending: false
+  onBusyChanged: if (!busy && autoTranslatePending) { autoTranslatePending = false; translate() }
   property string copiedAction: ""
   property string sourceLanguage: "en"
   property string targetLanguage: "ja"
@@ -251,10 +255,11 @@ Item {
   function activeTranslatorLabel() {
     if (translator === "ollama") return "Ollama Local · Gemma 3"
     if (translator === "openai") return "OpenAI · GPT-5 mini"
+    if (translator === "claude") return "Claude · Haiku"
     var engine = engineFor(translator)
     return engine ? engine.name : "Google"
   }
-  function usesLlm() { return translator === "ollama" || translator === "openai" }
+  function usesLlm() { return translatorUsesLlm(translator) }
   function newProfileId() { return "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) }
   function profileForId(id) {
     for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return profiles[i]
@@ -288,13 +293,14 @@ Item {
     if (!profile) return "No profile"
     return profile.name.length > 28 ? profile.name.slice(0, 27) + "…" : profile.name
   }
-  function translatorUsesLlm(id) { return id === "ollama" || id === "openai" }
+  function translatorUsesLlm(id) { return id === "ollama" || id === "openai" || id === "claude" }
   function reasoningEffortLabel(value) { return value.charAt(0).toUpperCase() + value.slice(1) }
   function openaiReasoningEffortIndex() { return openaiReasoningEfforts.indexOf(openaiReasoningEffort) }
   function translatorOptions() {
     var groups = [
       {title: "No key / public web", ids: ["google", "apertium", "bing", "reverso"]},
       {title: "Local model", ids: ["ollama"]},
+      {title: "Claude Code sign-in", ids: ["claude"]},
       {title: "API key required", ids: ["openai"]}
     ]
     var options = []
@@ -366,7 +372,7 @@ Item {
       translationPreview = ""
       translationStage = operation === "review" ? "reviewing" : "translating"
       translationReviewEnabled = operation === "review" || (params.reviewTranslation === true
-        && (params.translator === "ollama" || params.translator === "openai") && params.sourceLanguage !== params.targetLanguage)
+        && translatorUsesLlm(params.translator) && params.sourceLanguage !== params.targetLanguage)
       translationGeneratedCharacters = 0
       if (translationReviewEnabled) translatedText = ""
       translationStartedAt = Date.now()
@@ -920,6 +926,21 @@ Item {
     resetConfirmationVisible = false
     opened = true
     focusMainSelection()
+    if (!selectionReader.running) selectionReader.running = true
+  }
+  // Fill the source box with the primary selection and translate it. A
+  // selection that was already used is skipped, so reopening the overlay
+  // doesn't overwrite edits or retranslate stale text.
+  function useSelection(text) {
+    if (!opened || translating || setupOpen || profilesOpen) return
+    if (text.trim().length === 0 || text === lastSelection || text.length > maxChars) return
+    lastSelection = text
+    sourceBox.text = text
+    translatedText = ""
+    message = ""
+    messageError = false
+    if (canTranslate) translate()
+    else autoTranslatePending = true
   }
   function close() { opened = false }
   function dismiss() { opened = false; if (shell) shell.hide((manifest && manifest.id) || "shaun.quick-translate") }
@@ -964,6 +985,16 @@ Item {
     interval: root.translationStage === "reviewing" ? 900000 : 300000
     running: root.translating && bridge.translationRequest !== null && bridge.translationRequest.translator === "ollama"
     onTriggered: root.stopTranslation("timeout")
+  }
+
+  Process {
+    id: selectionReader
+    command: ["wl-paste", "--primary", "--no-newline", "--type", "text"]
+    // Empty output (no selection, or wl-paste failed) is ignored
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.useSelection(text)
+    }
   }
 
   Process {
